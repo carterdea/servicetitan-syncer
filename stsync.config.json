@@ -1,0 +1,28 @@
+{
+  "entities": {
+    "items": {
+      "prod_list_path": "/inventory/items",
+      "int_create_path": "/inventory/items",
+      "list_params": { "page": 1, "pageSize": 200, "orderBy": "modifiedOn" },
+      "list_data_key": "items",
+      "next_page_key": "nextPage",
+      "since_param": "modifiedSince"
+    },
+    "pos": {
+      "prod_list_path": "/purchasing/purchase-orders",
+      "int_create_path": "/purchasing/purchase-orders",
+      "list_params": { "page": 1, "pageSize": 200, "orderBy": "modifiedOn" },
+      "list_data_key": "items",
+      "next_page_key": "nextPage",
+      "since_param": "modifiedSince"
+    },
+    "jobs": {
+      "prod_list_path": "/job-management/jobs",
+      "int_create_path": "/job-management/jobs",
+      "list_params": { "page": 1, "pageSize": 200, "orderBy": "modifiedOn" },
+      "list_data_key": "items",
+      "next_page_key": "nextPage",
+      "since_param": "modifiedSince"
+    }
+  }
+}
