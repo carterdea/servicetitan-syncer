@@ -106,6 +106,9 @@ CLIENT_ID_INT = os.getenv("ST_CLIENT_ID_INT")
 CLIENT_SECRET_INT = os.getenv("ST_CLIENT_SECRET_INT")
 TENANT_ID_PROD = os.getenv("ST_TENANT_ID_PROD")
 TENANT_ID_INT = os.getenv("ST_TENANT_ID_INT")
+# App Keys (ServiceTitan v2 APIs)
+APP_KEY_PROD = os.getenv("ST_APP_KEY_PROD") or os.getenv("ST_APP_KEY")
+APP_KEY_INT = os.getenv("ST_APP_KEY_INT") or os.getenv("ST_APP_KEY")
 DB_PATH = os.getenv("STSYNC_DB", "stsync.sqlite3")
 PAGE_SIZE_DEFAULT = int(os.getenv("ST_PAGE_SIZE", "200"))
 HTTP_TIMEOUT = int(os.getenv("ST_HTTP_TIMEOUT", "30"))
@@ -118,6 +121,14 @@ def load_config() -> Dict[str, Any]:
         raise FileNotFoundError(f"Config file not found: {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+# ---------- URL helper ----------
+def build_url(base: str, path: str, tenant_id: str) -> str:
+    """Build full URL; replace optional {tenant} placeholder with tenant_id."""
+    if "{tenant}" in path:
+        path = path.replace("{tenant}", str(tenant_id))
+    return f"{base.rstrip('/')}/{path.lstrip('/')}"
 
 
 # ---------- Database (ID crosswalk) ----------
@@ -163,7 +174,13 @@ class IDMapper:
     retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError)),
 )
 def token(auth_url: str, client_id: str, client_secret: str, scope: str = "") -> str:
-    logger.info("Fetching OAuth token", url=auth_url)
+    # Determine environment from URL for better error messages
+    if "integration" in auth_url:
+        env_name = "Integration"
+    else:
+        env_name = "Production"
+
+    logger.info(f"Fetching OAuth token for {env_name}", url=auth_url)
     data = {"grant_type": "client_credentials"}
     if scope:
         data["scope"] = scope
@@ -177,16 +194,23 @@ def token(auth_url: str, client_id: str, client_secret: str, scope: str = "") ->
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
             logger.warning(
-                "Rate limited, backing off", status_code=e.response.status_code
+                f"Rate limited for {env_name}, backing off",
+                status_code=e.response.status_code,
             )
             raise  # Let tenacity handle retry
         logger.error(
-            "Auth failed", status_code=e.response.status_code, response=e.response.text
+            f"{env_name} auth failed",
+            status_code=e.response.status_code,
+            response=e.response.text,
         )
-        raise
+        # Create a more descriptive error
+        error_msg = f"{env_name} authentication failed: {e.response.text}"
+        if "invalid_client" in e.response.text:
+            error_msg += f"\nCheck your {env_name} CLIENT_ID and CLIENT_SECRET"
+        raise RuntimeError(error_msg)
     except Exception as e:
-        logger.error("Auth error", error=str(e))
-        raise
+        logger.error(f"{env_name} auth error", error=str(e))
+        raise RuntimeError(f"{env_name} authentication error: {str(e)}")
 
 
 def prod_token() -> str:
@@ -206,21 +230,26 @@ def int_token() -> str:
 def http_get(
     base: str, path: str, bearer: str, params: Dict[str, Any]
 ) -> Dict[str, Any]:
-    url = f"{base.rstrip('/')}/{path.lstrip('/')}"
-    logger.debug("Making GET request", url=url, params=params)
-
-    # Determine tenant ID based on base URL
+    # Determine env-specific values
     if base == API_BASE_PROD:
         tenant_id = TENANT_ID_PROD
+        app_key = APP_KEY_PROD
+        env_name = "Production"
     elif base == API_BASE_INT:
         tenant_id = TENANT_ID_INT
+        app_key = APP_KEY_INT
+        env_name = "Integration"
     else:
         raise ValueError(f"Unknown API base: {base}")
+
+    url = build_url(base, path, tenant_id)
+    logger.debug("Making GET request", url=url, params=params)
 
     try:
         headers = {
             "Authorization": f"Bearer {bearer}",
-            "ST-Tenant-Id": tenant_id,
+            # v2 APIs require App Key; tenant is in path
+            "ST-App-Key": app_key,
         }
         r = httpx.get(
             url,
@@ -248,6 +277,7 @@ def http_get(
             url=url,
             status_code=e.response.status_code,
             response=e.response.text[:500],
+            env=env_name,
         )
         raise
     except Exception as e:
@@ -263,22 +293,27 @@ def http_get(
 def http_post_json(
     base: str, path: str, bearer: str, payload: Dict[str, Any]
 ) -> Dict[str, Any]:
-    url = f"{base.rstrip('/')}/{path.lstrip('/')}"
-    logger.debug("Making POST request", url=url, payload_keys=list(payload.keys()))
-
-    # Determine tenant ID based on base URL
+    # Determine env-specific values
     if base == API_BASE_PROD:
         tenant_id = TENANT_ID_PROD
+        app_key = APP_KEY_PROD
+        env_name = "Production"
     elif base == API_BASE_INT:
         tenant_id = TENANT_ID_INT
+        app_key = APP_KEY_INT
+        env_name = "Integration"
     else:
         raise ValueError(f"Unknown API base: {base}")
+
+    url = build_url(base, path, tenant_id)
+    logger.debug("Making POST request", url=url, payload_keys=list(payload.keys()))
 
     try:
         headers = {
             "Authorization": f"Bearer {bearer}",
             "Content-Type": "application/json",
-            "ST-Tenant-Id": tenant_id,
+            # v2 APIs require App Key; tenant is in path
+            "ST-App-Key": app_key,
         }
         r = httpx.post(
             url,
@@ -309,6 +344,7 @@ def http_post_json(
             url=url,
             status_code=e.response.status_code,
             response=e.response.text[:500],
+            env=env_name,
         )
         raise
     except Exception as e:
@@ -328,7 +364,7 @@ def fetch_all(
         params[since_param] = since
 
     list_key = cfg.get("list_data_key") or "items"
-    next_key = cfg.get("next_page_key") or "nextPage"
+    next_key = cfg.get("next_page_key") or "hasMore"
     path = cfg["prod_list_path"]
 
     page_count = 0
@@ -350,24 +386,31 @@ def fetch_all(
             total_items += 1
             yield it
 
-        next_page = data.get(next_key)
-        if not next_page:
-            # Check if we might have more pages
-            if (
-                "page" in params
-                and "pageSize" in params
-                and len(items) == params["pageSize"]
-            ):
-                params["page"] = int(params["page"]) + 1
+        # Pagination handling variants
+        if "hasMore" in data:
+            if data.get("hasMore"):
+                params["page"] = int(params.get("page", 1)) + 1
                 continue
-            break
+            else:
+                break
 
+        next_page = data.get(next_key)
         if isinstance(next_page, int):
             params["page"] = next_page
-        elif isinstance(next_page, str):
+            continue
+        if isinstance(next_page, str) and next_page:
             params["continuationToken"] = next_page
-        else:
-            break
+            continue
+
+        # Fallback: advance if page appears full
+        if (
+            "page" in params
+            and "pageSize" in params
+            and len(items) >= int(params["pageSize"])
+        ):
+            params["page"] = int(params["page"]) + 1
+            continue
+        break
 
 
 # ---------- Field mappers (with Pydantic validation) ----------
@@ -486,6 +529,8 @@ def ensure_env():
         ("ST_CLIENT_SECRET_INT", CLIENT_SECRET_INT),
         ("ST_TENANT_ID_PROD", TENANT_ID_PROD),
         ("ST_TENANT_ID_INT", TENANT_ID_INT),
+        ("ST_APP_KEY_PROD or ST_APP_KEY", APP_KEY_PROD),
+        ("ST_APP_KEY_INT or ST_APP_KEY", APP_KEY_INT),
     ]
 
     missing = [k for k, v in required if not v]

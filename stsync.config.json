@@ -1,27 +1,27 @@
 {
   "entities": {
     "items": {
-      "prod_list_path": "/inventory/items",
-      "int_create_path": "/inventory/items",
-      "list_params": { "page": 1, "pageSize": 200, "orderBy": "modifiedOn" },
-      "list_data_key": "items",
-      "next_page_key": "nextPage",
+      "prod_list_path": "/pricebook/v2/tenant/{tenant}/materials",
+      "int_create_path": "/pricebook/v2/tenant/{tenant}/materials",
+      "list_params": { "page": 1, "pageSize": 200 },
+      "list_data_key": "data",
+      "next_page_key": "hasMore",
       "since_param": "modifiedSince"
     },
     "pos": {
-      "prod_list_path": "/purchasing/purchase-orders",
-      "int_create_path": "/purchasing/purchase-orders",
-      "list_params": { "page": 1, "pageSize": 200, "orderBy": "modifiedOn" },
-      "list_data_key": "items",
-      "next_page_key": "nextPage",
+      "prod_list_path": "/inventory/v2/tenant/{tenant}/purchase-orders",
+      "int_create_path": "/inventory/v2/tenant/{tenant}/purchase-orders",
+      "list_params": { "page": 1, "pageSize": 200 },
+      "list_data_key": "data",
+      "next_page_key": "hasMore",
       "since_param": "modifiedSince"
     },
     "jobs": {
-      "prod_list_path": "/job-management/jobs",
-      "int_create_path": "/job-management/jobs",
-      "list_params": { "page": 1, "pageSize": 200, "orderBy": "modifiedOn" },
-      "list_data_key": "items",
-      "next_page_key": "nextPage",
+      "prod_list_path": "/jpm/v2/tenant/{tenant}/jobs",
+      "int_create_path": "/jpm/v2/tenant/{tenant}/jobs",
+      "list_params": { "page": 1, "pageSize": 200 },
+      "list_data_key": "data",
+      "next_page_key": "hasMore",
       "since_param": "modifiedSince"
     }
   }

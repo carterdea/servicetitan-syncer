@@ -94,6 +94,10 @@ ST_CLIENT_SECRET_PROD=your_prod_client_secret
 ST_CLIENT_ID_INT=your_int_client_id
 ST_CLIENT_SECRET_INT=your_int_client_secret
 
+# Required App Keys (v2 APIs)
+ST_APP_KEY_PROD=your_prod_app_key
+ST_APP_KEY_INT=your_int_app_key
+
 # Database
 STSYNC_DB=stsync.sqlite3
 
@@ -109,16 +113,20 @@ Adjust paths and pagination keys to match your ServiceTitan tenant:
 {
   "entities": {
     "items": {
-      "prod_list_path": "/inventory/items",
-      "int_create_path": "/inventory/items",
-      "list_params": { "page": 1, "pageSize": 200, "orderBy": "modifiedOn" },
-      "list_data_key": "items",
-      "next_page_key": "nextPage",
+      "prod_list_path": "/pricebook/v2/tenant/{tenant}/materials",
+      "int_create_path": "/pricebook/v2/tenant/{tenant}/materials",
+      "list_params": { "page": 1, "pageSize": 200 },
+      "list_data_key": "data",
+      "next_page_key": "hasMore",
       "since_param": "modifiedSince"
     }
   }
 }
 ```
+
+Notes:
+- Endpoints use the v2 shape: `/<domain>/v2/tenant/{tenant}/...` and the `{tenant}` placeholder is replaced from `.env`.
+- The client now sends the required `ST-App-Key` header. Be sure to set `ST_APP_KEY_*`.
 
 ## ID Mapping
 
