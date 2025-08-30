@@ -921,7 +921,6 @@ def _get_integration_warehouse_info(wh_id: int, it: str) -> Dict[str, Any]:
             continue
     return {}
 
-
 def _get_integration_po_type_id(bearer: str) -> Optional[int]:
     try:
         data = http_get(
@@ -938,7 +937,6 @@ def _get_integration_po_type_id(bearer: str) -> Optional[int]:
         return kinds[0].get("id") if kinds else None
     except Exception:
         return None
-
 def _ensure_warehouse_integration(
     warehouse_id: int, pt: str, it: str, db: IDMapper, dry_run: bool
 ) -> Optional[int]:
