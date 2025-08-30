@@ -921,6 +921,22 @@ def _get_integration_warehouse_info(wh_id: int, it: str) -> Dict[str, Any]:
             continue
     return {}
 
+def _get_integration_po_type_id(bearer: str) -> Optional[int]:
+    try:
+        data = http_get(
+            API_BASE_INT,
+            "/inventory/v2/tenant/{tenant}/purchase-order-types",
+            bearer,
+            {"page": 1, "pageSize": 200},
+        )
+        kinds = data.get("data") or data.get("items") or []
+        for k in kinds:
+            nm = (k.get("name") or "").lower()
+            if "stock" in nm or "inventory" in nm:
+                return k.get("id")
+        return kinds[0].get("id") if kinds else None
+    except Exception:
+        return None
 def _ensure_warehouse_integration(
     warehouse_id: int, pt: str, it: str, db: IDMapper, dry_run: bool
 ) -> Optional[int]:
@@ -1245,11 +1261,11 @@ def sync(kind, since, limit, dry_run, verbose):
         pt = prod_token()
         it = int_token()
 
-        # Select mapper
+        # Select mapper or specialized flow
         if kind == "items":
             mapper = lambda src: map_item_for_create(src)
         elif kind == "pos":
-            mapper = lambda src: map_po_for_create(src, db.get)
+            mapper = None  # handled by v2 flow below
         elif kind == "jobs":
             mapper = lambda src: map_job_for_create(src, db.get)
         else:
@@ -1262,6 +1278,10 @@ def sync(kind, since, limit, dry_run, verbose):
         errors = 0
 
         print_msg(f"Syncing {kind}...")
+
+        # Pre-fetch optional constants
+        po_type_id_cache: Optional[int] = None
+
         for src in fetch_all(ent, API_BASE_PROD, pt, since):
             prod_id = str(
                 src.get("id") or src.get("guid") or src.get("externalId") or ""
@@ -1276,36 +1296,183 @@ def sync(kind, since, limit, dry_run, verbose):
                 continue
 
             try:
-                payload = mapper(src)
-
-                if dry_run:
-                    print_msg(f"DRY RUN - Would create {kind}:")
-                    print(json.dumps(payload, indent=2))
-                else:
-                    created_data = http_post_json(
-                        API_BASE_INT, ent["int_create_path"], it, payload
-                    )
-                    int_id = str(
-                        created_data.get("id")
-                        or created_data.get("guid")
-                        or created_data.get("externalId")
-                        or ""
-                    )
-
-                    if int_id:
-                        db.put(kind, prod_id, int_id)
-                        created += 1
-                        logger.info(
-                            "Created record", kind=kind, prod_id=prod_id, int_id=int_id
-                        )
+                if kind != "pos":
+                    # Legacy flow for items/jobs
+                    payload = mapper(src)  # type: ignore
+                    if dry_run:
+                        print_msg(f"DRY RUN - Would create {kind}:")
+                        print(json.dumps(payload, indent=2))
                     else:
-                        print_msg(f"Warning: no id returned for Prod {prod_id}")
+                        created_data = http_post_json(
+                            API_BASE_INT, ent["int_create_path"], it, payload
+                        )
+                        int_id = str(
+                            created_data.get("id")
+                            or created_data.get("guid")
+                            or created_data.get("externalId")
+                            or ""
+                        )
+                        if int_id:
+                            db.put(kind, prod_id, int_id)
+                            created += 1
+                            logger.info(
+                                "Created record", kind=kind, prod_id=prod_id, int_id=int_id
+                            )
+                        else:
+                            print_msg(f"Warning: no id returned for Prod {prod_id}")
+                            errors += 1
+                else:
+                    # v2 Purchase Order flow
+                    # Ensure vendor
+                    vendor_id = src.get("vendorId") or (src.get("vendor") or {}).get("id")
+                    vendor_int_id: Optional[int] = None
+                    if vendor_id:
+                        vendor_int_id = _ensure_vendor_integration(int(vendor_id), pt, it, db, dry_run)
+
+                    # Ensure warehouse (from id or name, else env/default)
+                    warehouse_id = src.get("warehouseId") or (src.get("warehouse") or {}).get("id")
+                    warehouse_name = (src.get("warehouse") or {}).get("name") or ""
+                    wh_int_id: Optional[int] = None
+                    if warehouse_id:
+                        wh_int_id = _ensure_warehouse_integration(int(warehouse_id), pt, it, db, dry_run)
+                    if wh_int_id is None and warehouse_name:
+                        wh_int_id = _find_integration_warehouse_by_name(warehouse_name, it)
+                    if wh_int_id is None:
+                        env_wh = os.getenv("ST_DEFAULT_WAREHOUSE_ID_INT")
+                        if env_wh and env_wh.isdigit():
+                            wh_int_id = int(env_wh)
+
+                    # Resolve BU
+                    bu_int_id: Optional[int] = None
+                    bu_obj = src.get("businessUnit") if isinstance(src.get("businessUnit"), dict) else None
+                    bu_name = bu_obj.get("name") if bu_obj else None
+                    bu_id_prod = src.get("businessUnitId") or (bu_obj or {}).get("id")
+                    if not bu_name and bu_id_prod:
+                        bu_name = _get_prod_business_unit_name(int(bu_id_prod), pt)
+                    if bu_name:
+                        bu_int_id = _find_integration_business_unit_by_name(bu_name, it)
+                    if not bu_int_id:
+                        bu_env = os.getenv("ST_DEFAULT_BUSINESS_UNIT_ID_INT")
+                        if bu_env and bu_env.isdigit():
+                            bu_int_id = int(bu_env)
+
+                    # Items → ensure materials + build items[]
+                    lines_src = src.get("items") or src.get("lines") or []
+                    items_payload: List[Dict[str, Any]] = []
+                    for ln in lines_src:
+                        src_item_id = (
+                            ln.get("itemId")
+                            or ln.get("pricebookItemId")
+                            or ln.get("materialId")
+                            or ln.get("equipmentId")
+                            or ln.get("skuId")
+                        )
+                        if not src_item_id:
+                            continue
+                        code_hint = (
+                            ln.get("code")
+                            or ln.get("itemCode")
+                            or ln.get("skuCode")
+                            or ln.get("sku")
+                        )
+                        name_hint = ln.get("name") or ln.get("skuName") or ln.get("description")
+                        int_item_id = _ensure_material_integration(
+                            int(src_item_id), pt, it, db, dry_run, code_hint, name_hint
+                        )
+                        qty = ln.get("quantity") or ln.get("qty") or 0
+                        unit_cost = ln.get("unitCost") or ln.get("unitPrice") or ln.get("cost")
+                        items_payload.append(
+                            {
+                                "itemId": int_item_id,
+                                "skuId": int_item_id,
+                                "quantity": qty,
+                                "quantityOrdered": qty,
+                                "unitCost": unit_cost,
+                                "cost": unit_cost,
+                                **({"description": name_hint} if name_hint else {}),
+                                **({"vendorPartNumber": ln.get("vendorPartNumber")} if ln.get("vendorPartNumber") else {}),
+                            }
+                        )
+
+                    if not items_payload:
+                        logger.warning("Skipping PO with no items", prod_id=prod_id)
+                        skipped += 1
+                        continue
+
+                    # PO type id (cache)
+                    if po_type_id_cache is None:
+                        po_type_id_cache = _get_integration_po_type_id(it)
+                    if not po_type_id_cache:
+                        print_error("Could not determine a purchase order typeId in Integration")
                         errors += 1
+                        continue
+
+                    # Warehouse needed
+                    if not wh_int_id:
+                        print_error("No Integration warehouse id resolved; set ST_DEFAULT_WAREHOUSE_ID_INT")
+                        errors += 1
+                        continue
+
+                    # Warehouse details for shipTo
+                    wh_details = _get_integration_warehouse_info(int(wh_int_id), it) if wh_int_id else {}
+                    addr_env = {
+                        "street": os.getenv("ST_SHIPTO_STREET", ""),
+                        "unit": os.getenv("ST_SHIPTO_UNIT", ""),
+                        "city": os.getenv("ST_SHIPTO_CITY", ""),
+                        "state": os.getenv("ST_SHIPTO_STATE", ""),
+                        "zip": os.getenv("ST_SHIPTO_ZIP", ""),
+                        "country": os.getenv("ST_SHIPTO_COUNTRY", "US"),
+                    }
+                    addr_norm = _normalize_address(wh_details.get("address") or {})
+                    for k, v in addr_env.items():
+                        if v:
+                            addr_norm[k] = v
+
+                    po_body = {
+                        "vendorId": int(vendor_int_id) if vendor_int_id is not None else int(vendor_id) if vendor_id else 0,
+                        "date": src.get("createdOn") or src.get("orderedOn") or src.get("modifiedOn") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "typeId": int(po_type_id_cache),
+                        "externalNumber": f"PROD-{src.get('id') or prod_id}",
+                        "inventoryLocationId": int(wh_int_id),
+                        "shipTo": {
+                            "inventoryLocationId": int(wh_int_id),
+                            "description": wh_details.get("name") or wh_details.get("displayName") or "Ship to Integration Warehouse",
+                            "address": addr_norm,
+                        },
+                        "tax": 0,
+                        "shipping": 0,
+                        "requiredOn": src.get("requiredOn") or src.get("expectedOn") or src.get("createdOn") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "businessUnitId": int(bu_int_id) if bu_int_id else None,
+                        "impactsTechnicianPayroll": False,
+                        "items": [
+                            {k: v for k, v in itm.items() if v is not None}
+                            for itm in items_payload
+                        ],
+                    }
+                    po_body = {k: v for k, v in po_body.items() if v is not None}
+
+                    if dry_run:
+                        print_msg("DRY RUN - Would create pos:")
+                        print(json.dumps(po_body, indent=2))
+                    else:
+                        created_data = http_post_json(
+                            API_BASE_INT,
+                            "/inventory/v2/tenant/{tenant}/purchase-orders",
+                            it,
+                            po_body,
+                            allow_wrapper_retry=False,
+                        )
+                        int_id = str(created_data.get("id") or "")
+                        if int_id:
+                            db.put(kind, prod_id, int_id)
+                            created += 1
+                            logger.info("Created record", kind=kind, prod_id=prod_id, int_id=int_id)
+                        else:
+                            print_msg(f"Warning: no id returned for Prod {prod_id}")
+                            errors += 1
 
             except Exception as e:
-                logger.error(
-                    "Failed to process record", kind=kind, prod_id=prod_id, error=str(e)
-                )
+                logger.error("Failed to process record", kind=kind, prod_id=prod_id, error=str(e))
                 errors += 1
                 continue
 
