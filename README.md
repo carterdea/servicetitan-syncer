@@ -97,6 +97,8 @@ ST_CLIENT_SECRET_INT=your_int_client_secret
 # Required App Keys (v2 APIs)
 ST_APP_KEY_PROD=your_prod_app_key
 ST_APP_KEY_INT=your_int_app_key
+ST_DEFAULT_WAREHOUSE_ID_INT=110  # optional fallback for shipTo
+ST_DEFAULT_BUSINESS_UNIT_ID_INT=   # optional; set if PO create requires BU
 
 # Database
 STSYNC_DB=stsync.sqlite3
