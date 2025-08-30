@@ -13,20 +13,20 @@
 - ✅ Rate limiting protection
 - ✅ Idempotent operations (skips already-synced records)
 
-## Setup (UV only)
+## Setup (uv-only)
 
-1. Create a virtual env (Python 3.11 recommended):
+1) Create venv (Python 3.11):
    ```bash
    uv venv --python 3.11
    source .venv/bin/activate
    ```
 
-2. Install dependencies:
+2) Install via pyproject (no pip):
    ```bash
-   uv pip install -r requirements.txt
+   uv sync
    ```
 
-3. Configure env:
+3) Configure env:
    ```bash
    cp env.example .env
    # Fill in OAuth clients + API bases for both environments
@@ -35,7 +35,7 @@
 ## Verify Setup
 
 ```bash
-python stsync.py verify
+uv run stsync verify
 ```
 
 This will:
@@ -48,9 +48,9 @@ This will:
 
 ```bash
 # Test with small limits first
-python stsync.py sync items --since 2025-08-01 --limit 5 --dry-run
-python stsync.py sync pos   --since 2025-08-01 --limit 3 --dry-run
-python stsync.py sync jobs  --since 2025-08-01 --limit 3 --dry-run
+uv run stsync sync items --since 2025-08-01 --limit 5 --dry-run
+uv run stsync sync pos   --since 2025-08-01 --limit 3 --dry-run
+uv run stsync sync jobs  --since 2025-08-01 --limit 3 --dry-run
 ```
 
 ## Run for Real (Items → POs → Jobs)
@@ -59,13 +59,23 @@ python stsync.py sync jobs  --since 2025-08-01 --limit 3 --dry-run
 
 ```bash
 # Sync items first (no dependencies)
-python stsync.py sync items --since 2025-08-01 --limit 100
+uv run stsync sync items --since 2025-08-01 --limit 100
 
 # Then POs (depends on items + vendors)
-python stsync.py sync pos   --since 2025-08-01 --limit 50
+uv run stsync sync pos   --since 2025-08-01 --limit 50
 
 # Finally jobs (depends on customers, locations, job types, campaigns)
-python stsync.py sync jobs  --since 2025-08-01 --limit 50
+uv run stsync sync jobs  --since 2025-08-01 --limit 50
+```
+
+## One-off copy by Production PO ID
+
+```bash
+# Dry run (prints payloads)
+uv run stsync copy-po --id <PROD_PO_ID> --dry-run --verbose
+
+# Real run (ensures vendor/materials/warehouse, creates PO in Integration)
+uv run stsync copy-po --id <PROD_PO_ID> --verbose
 ```
 
 ## Command Options
@@ -99,6 +109,14 @@ ST_APP_KEY_PROD=your_prod_app_key
 ST_APP_KEY_INT=your_int_app_key
 ST_DEFAULT_WAREHOUSE_ID_INT=110  # optional fallback for shipTo
 ST_DEFAULT_BUSINESS_UNIT_ID_INT=   # optional; set if PO create requires BU
+
+# Optional ship-to address fallback (if warehouse lacks an address)
+ST_SHIPTO_STREET=
+ST_SHIPTO_UNIT=
+ST_SHIPTO_CITY=
+ST_SHIPTO_STATE=
+ST_SHIPTO_ZIP=
+ST_SHIPTO_COUNTRY=US
 
 # Database
 STSYNC_DB=stsync.sqlite3
@@ -184,7 +202,7 @@ The order of syncing is important due to foreign key relationships:
 
 Use `--verbose` flag for detailed logging:
 ```bash
-python stsync.py sync items --verbose --limit 1
+uv run stsync sync items --verbose --limit 1
 ```
 
 ## Safety Features
