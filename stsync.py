@@ -18,30 +18,29 @@ Usage:
   python stsync.py sync jobs --since 2025-08-01 --dry-run
 """
 
-import os
 import json
+import logging
+import os
 import sqlite3
 import time
-from typing import Dict, Any, Iterable, Optional, List
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import click
 import httpx
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential_jitter,
-    retry_if_exception_type,
-)
+import structlog
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
-import structlog
-import logging
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 # Configure structured logging
-logging.basicConfig(
-    level=logging.INFO, format="%(message)s", handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[logging.StreamHandler()])
 logger = structlog.get_logger()
 
 
@@ -62,47 +61,47 @@ def print_success(msg):
 class ItemCreate(BaseModel):
     code: str
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     active: bool = True
 
 
 class POLineCreate(BaseModel):
     itemId: int
     quantity: float
-    unitCost: Optional[float] = None
+    unitCost: float | None = None
 
 
 class POCreate(BaseModel):
     vendorId: int
-    warehouseId: Optional[int] = None
+    warehouseId: int | None = None
     externalNumber: str
-    lines: List[POLineCreate] = Field(default_factory=list)
+    lines: list[POLineCreate] = Field(default_factory=list)
 
 
 class JobCreate(BaseModel):
     customerId: int
     locationId: int
     jobTypeId: int
-    campaignId: Optional[int] = None
+    campaignId: int | None = None
     source: str = "stsync"
     externalNumber: str
     notes: str
 
 
 class APIResponse(BaseModel):
-    id: Optional[int] = None
-    guid: Optional[str] = None
-    externalId: Optional[str] = None
+    id: int | None = None
+    guid: str | None = None
+    externalId: str | None = None
 
 
 class VendorCreate(BaseModel):
     name: str
-    externalNumber: Optional[str] = None
+    externalNumber: str | None = None
 
 
 class WarehouseCreate(BaseModel):
     name: str
-    externalNumber: Optional[str] = None
+    externalNumber: str | None = None
 
 
 # ---------- Environment Variables ----------
@@ -126,11 +125,11 @@ HTTP_TIMEOUT = int(os.getenv("ST_HTTP_TIMEOUT", "30"))
 
 
 # ---------- Configuration ----------
-def load_config() -> Dict[str, Any]:
+def load_config() -> dict[str, Any]:
     config_path = Path("stsync.config.json")
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -158,7 +157,7 @@ class IDMapper:
                 PRIMARY KEY(kind, prod_id)
             )""")
 
-    def get(self, kind: str, prod_id: str) -> Optional[str]:
+    def get(self, kind: str, prod_id: str) -> str | None:
         with sqlite3.connect(self.db_path) as cx:
             cur = cx.execute(
                 "SELECT int_id FROM id_map WHERE kind=? AND prod_id=?", (kind, prod_id)
@@ -197,9 +196,7 @@ def token(auth_url: str, client_id: str, client_secret: str, scope: str = "") ->
         data["scope"] = scope
 
     try:
-        r = httpx.post(
-            auth_url, data=data, auth=(client_id, client_secret), timeout=HTTP_TIMEOUT
-        )
+        r = httpx.post(auth_url, data=data, auth=(client_id, client_secret), timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         return r.json()["access_token"]
     except httpx.HTTPStatusError as e:
@@ -218,10 +215,10 @@ def token(auth_url: str, client_id: str, client_secret: str, scope: str = "") ->
         error_msg = f"{env_name} authentication failed: {e.response.text}"
         if "invalid_client" in e.response.text:
             error_msg += f"\nCheck your {env_name} CLIENT_ID and CLIENT_SECRET"
-        raise RuntimeError(error_msg)
+        raise RuntimeError(error_msg) from e
     except Exception as e:
         logger.error(f"{env_name} auth error", error=str(e))
-        raise RuntimeError(f"{env_name} authentication error: {str(e)}")
+        raise RuntimeError(f"{env_name} authentication error: {str(e)}") from e
 
 
 def prod_token() -> str:
@@ -238,9 +235,7 @@ def int_token() -> str:
     wait=wait_exponential_jitter(1, 5),
     retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError)),
 )
-def http_get(
-    base: str, path: str, bearer: str, params: Dict[str, Any]
-) -> Dict[str, Any]:
+def http_get(base: str, path: str, bearer: str, params: dict[str, Any]) -> dict[str, Any]:
     # Determine env-specific values
     if base == API_BASE_PROD:
         tenant_id = TENANT_ID_PROD
@@ -270,14 +265,10 @@ def http_get(
         )
 
         if r.status_code == 429:
-            logger.warning(
-                "Rate limited, backing off", url=url, status_code=r.status_code
-            )
+            logger.warning("Rate limited, backing off", url=url, status_code=r.status_code)
             raise httpx.HTTPStatusError("Rate limited", request=r.request, response=r)
         elif r.status_code >= 500:
-            logger.error(
-                "Server error", url=url, status_code=r.status_code, response=r.text
-            )
+            logger.error("Server error", url=url, status_code=r.status_code, response=r.text)
             raise RuntimeError(f"GET {url} -> {r.status_code}")
 
         r.raise_for_status()
@@ -305,9 +296,9 @@ def http_post_json(
     base: str,
     path: str,
     bearer: str,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     allow_wrapper_retry: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     # Determine env-specific values
     if base == API_BASE_PROD:
         tenant_id = TENANT_ID_PROD
@@ -333,9 +324,7 @@ def http_post_json(
         r = httpx.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
 
         if r.status_code == 429:
-            logger.warning(
-                "Rate limited, backing off", url=url, status_code=r.status_code
-            )
+            logger.warning("Rate limited, backing off", url=url, status_code=r.status_code)
             raise httpx.HTTPStatusError("Rate limited", request=r.request, response=r)
         # Do not retry on other 4xx client errors
         if 400 <= r.status_code < 500:
@@ -351,9 +340,7 @@ def http_post_json(
                 try:
                     wrapped = {"request": payload}
                     logger.info("Retrying POST with request wrapper", url=url)
-                    r2 = httpx.post(
-                        url, headers=headers, json=wrapped, timeout=HTTP_TIMEOUT
-                    )
+                    r2 = httpx.post(url, headers=headers, json=wrapped, timeout=HTTP_TIMEOUT)
                     r2.raise_for_status()
                     try:
                         return r2.json()
@@ -368,9 +355,7 @@ def http_post_json(
         try:
             return r.json()
         except Exception:
-            logger.warning(
-                "No JSON response from POST", url=url, status_code=r.status_code
-            )
+            logger.warning("No JSON response from POST", url=url, status_code=r.status_code)
             return {}
 
     except httpx.HTTPStatusError as e:
@@ -388,8 +373,8 @@ def http_post_json(
 
 
 def fetch_all(
-    cfg: Dict[str, Any], base: str, bearer: str, since: Optional[str]
-) -> Iterable[Dict[str, Any]]:
+    cfg: dict[str, Any], base: str, bearer: str, since: str | None
+) -> Iterable[dict[str, Any]]:
     params = dict(cfg.get("list_params") or {})
     if "pageSize" in params and not params["pageSize"]:
         params["pageSize"] = PAGE_SIZE_DEFAULT
@@ -438,18 +423,14 @@ def fetch_all(
             continue
 
         # Fallback: advance if page appears full
-        if (
-            "page" in params
-            and "pageSize" in params
-            and len(items) >= int(params["pageSize"])
-        ):
+        if "page" in params and "pageSize" in params and len(items) >= int(params["pageSize"]):
             params["page"] = int(params["page"]) + 1
             continue
         break
 
 
 # ---------- Field mappers (with Pydantic validation) ----------
-def map_item_for_create(src: Dict[str, Any]) -> Dict[str, Any]:
+def map_item_for_create(src: dict[str, Any]) -> dict[str, Any]:
     """Map production item to integration create payload"""
     try:
         item = ItemCreate(
@@ -464,7 +445,7 @@ def map_item_for_create(src: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
 
-def map_po_for_create(src: Dict[str, Any], xlate) -> Dict[str, Any]:
+def map_po_for_create(src: dict[str, Any], xlate) -> dict[str, Any]:
     """Map production PO to integration create payload"""
     lines = []
     for ln in src.get("lines") or []:
@@ -518,7 +499,7 @@ def map_po_for_create(src: Dict[str, Any], xlate) -> Dict[str, Any]:
         raise
 
 
-def map_job_for_create(src: Dict[str, Any], xlate) -> Dict[str, Any]:
+def map_job_for_create(src: dict[str, Any], xlate) -> dict[str, Any]:
     """Map production job to integration create payload"""
     try:
         cust_id = src.get("customerId")
@@ -613,7 +594,7 @@ def verify():
         return
 
     try:
-        it = int_token()
+        int_token()
         print_success("Integration authentication OK")
     except Exception as e:
         print_error(f"Integration auth failed: {e}")
@@ -622,9 +603,7 @@ def verify():
     # Test basic API call
     try:
         ent = cfg["entities"]["items"]
-        data = http_get(
-            API_BASE_PROD, ent["prod_list_path"], pt, {"page": 1, "pageSize": 1}
-        )
+        _ = http_get(API_BASE_PROD, ent["prod_list_path"], pt, {"page": 1, "pageSize": 1})
         print_success("Production API connection OK")
     except Exception as e:
         print_error(f"Production API test failed: {e}")
@@ -633,14 +612,16 @@ def verify():
     print_success("All checks passed! Ready to sync.")
 
 
-def _get_prod_po_by_id(po_id: str, bearer: str) -> Dict[str, Any]:
+def _get_prod_po_by_id(po_id: str, bearer: str) -> dict[str, Any]:
     """Fetch a single Purchase Order from Production by ID (v2 path)."""
     # Common v2 path
     path = f"/inventory/v2/tenant/{{tenant}}/purchase-orders/{po_id}"
     return http_get(API_BASE_PROD, path, bearer, params={})
 
 
-def _ensure_vendor_integration(vendor_id: int, pt: str, it: str, db: IDMapper, dry_run: bool) -> Optional[int]:
+def _ensure_vendor_integration(
+    vendor_id: int, pt: str, it: str, db: IDMapper, dry_run: bool
+) -> int | None:
     vid = str(vendor_id)
     existing = db.get("vendors", vid)
     if existing:
@@ -661,7 +642,7 @@ def _ensure_vendor_integration(vendor_id: int, pt: str, it: str, db: IDMapper, d
         db.put("vendors", vid, str(existing_integration_id))
         return int(existing_integration_id)
     # Build richer payload to satisfy required fields in Integration
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "name": v.get("name") or v.get("displayName") or f"Vendor {vendor_id}",
         "externalNumber": v.get("externalNumber") or f"PROD-{vendor_id}",
         "active": bool(v.get("active", True)),
@@ -701,9 +682,9 @@ def _ensure_material_integration(
     it: str,
     db: IDMapper,
     dry_run: bool,
-    fallback_code: Optional[str] = None,
-    fallback_name: Optional[str] = None,
-) -> Optional[int]:
+    fallback_code: str | None = None,
+    fallback_name: str | None = None,
+) -> int | None:
     iid = str(item_id)
     existing = db.get("items", iid)
     if existing:
@@ -714,9 +695,7 @@ def _ensure_material_integration(
 
     # Try fetch as material
     try:
-        m = http_get(
-            API_BASE_PROD, f"/pricebook/v2/tenant/{{tenant}}/materials/{item_id}", pt, {}
-        )
+        m = http_get(API_BASE_PROD, f"/pricebook/v2/tenant/{{tenant}}/materials/{item_id}", pt, {})
         item = ItemCreate(
             code=m.get("code") or m.get("itemCode") or f"PROD-{item_id}",
             name=m.get("name") or m.get("description") or f"Material {item_id}",
@@ -778,7 +757,11 @@ def _ensure_material_integration(
         if isinstance(code, str) and "unique" in str(e).lower():
             alt = {**payload, "code": f"{code} - PROD-{item_id}"}
             created = http_post_json(
-                API_BASE_INT, "/pricebook/v2/tenant/{tenant}/materials", it, alt, allow_wrapper_retry=False
+                API_BASE_INT,
+                "/pricebook/v2/tenant/{tenant}/materials",
+                it,
+                alt,
+                allow_wrapper_retry=False,
             )
             new_id = created.get("id")
             if new_id is not None:
@@ -788,7 +771,7 @@ def _ensure_material_integration(
     return None
 
 
-def _find_integration_vendor_by_name(name: str, it: str) -> Optional[int]:
+def _find_integration_vendor_by_name(name: str, it: str) -> int | None:
     """Scan Integration vendors and return id by exact name (case-insensitive)."""
     cfg = {
         "prod_list_path": "/inventory/v2/tenant/{tenant}/vendors",
@@ -801,17 +784,16 @@ def _find_integration_vendor_by_name(name: str, it: str) -> Optional[int]:
         return None
     for ven in fetch_all(cfg, API_BASE_INT, it, since=None):
         cand = (
-            ven.get("name")
-            or ven.get("displayName")
-            or ven.get("legalName")
-            or ""
-        ).strip().lower()
+            (ven.get("name") or ven.get("displayName") or ven.get("legalName") or "")
+            .strip()
+            .lower()
+        )
         if cand == name_l:
             return ven.get("id")
     return None
 
 
-def _find_integration_material_by_code(code: str, it: str) -> Optional[int]:
+def _find_integration_material_by_code(code: str, it: str) -> int | None:
     """Scan Integration materials and return id by exact code (case-insensitive)."""
     cfg = {
         "prod_list_path": "/pricebook/v2/tenant/{tenant}/materials",
@@ -829,7 +811,7 @@ def _find_integration_material_by_code(code: str, it: str) -> Optional[int]:
     return None
 
 
-def _find_integration_business_unit_by_name(name: str, it: str) -> Optional[int]:
+def _find_integration_business_unit_by_name(name: str, it: str) -> int | None:
     """Return Integration businessUnit id by exact name (case-insensitive)."""
     paths = [
         "/crm/v2/tenant/{tenant}/business-units",
@@ -850,7 +832,7 @@ def _find_integration_business_unit_by_name(name: str, it: str) -> Optional[int]
     return None
 
 
-def _get_prod_business_unit_name(bu_id: int, pt: str) -> Optional[str]:
+def _get_prod_business_unit_name(bu_id: int, pt: str) -> str | None:
     """Look up Production business unit name by id (try CRM and Settings paths)."""
     paths = [
         f"/crm/v2/tenant/{{tenant}}/business-units/{bu_id}",
@@ -867,7 +849,7 @@ def _get_prod_business_unit_name(bu_id: int, pt: str) -> Optional[str]:
     return None
 
 
-def _find_integration_warehouse_by_name(name: str, it: str) -> Optional[int]:
+def _find_integration_warehouse_by_name(name: str, it: str) -> int | None:
     """Scan Integration warehouses and return id for a name match (case-insensitive)."""
     cfg = {
         "prod_list_path": "/inventory/v2/tenant/{tenant}/warehouses",
@@ -885,7 +867,7 @@ def _find_integration_warehouse_by_name(name: str, it: str) -> Optional[int]:
     return None
 
 
-def _normalize_address(addr: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_address(addr: dict[str, Any]) -> dict[str, Any]:
     """Map various address shapes to the required keys: street, unit, city, state, zip, country."""
     if not isinstance(addr, dict):
         addr = {}
@@ -905,7 +887,7 @@ def _normalize_address(addr: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _get_integration_warehouse_info(wh_id: int, it: str) -> Dict[str, Any]:
+def _get_integration_warehouse_info(wh_id: int, it: str) -> dict[str, Any]:
     """Find a warehouse in Integration by id via list scan and return its dict (or {})."""
     cfg = {
         "prod_list_path": "/inventory/v2/tenant/{tenant}/warehouses",
@@ -921,7 +903,8 @@ def _get_integration_warehouse_info(wh_id: int, it: str) -> Dict[str, Any]:
             continue
     return {}
 
-def _get_integration_po_type_id(bearer: str) -> Optional[int]:
+
+def _get_integration_po_type_id(bearer: str) -> int | None:
     try:
         data = http_get(
             API_BASE_INT,
@@ -937,9 +920,11 @@ def _get_integration_po_type_id(bearer: str) -> Optional[int]:
         return kinds[0].get("id") if kinds else None
     except Exception:
         return None
+
+
 def _ensure_warehouse_integration(
     warehouse_id: int, pt: str, it: str, db: IDMapper, dry_run: bool
-) -> Optional[int]:
+) -> int | None:
     wid = str(warehouse_id)
     existing = db.get("warehouses", wid)
     if existing:
@@ -965,7 +950,7 @@ def _ensure_warehouse_integration(
         return int(maybe_id)
 
     # Build payload; include address if available
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "name": w_name,
         "active": bool(w.get("active", True)),
         "externalNumber": w.get("externalNumber") or f"PROD-{warehouse_id}",
@@ -978,9 +963,7 @@ def _ensure_warehouse_integration(
         logger.info("DRY RUN - Would create warehouse", payload=payload)
         return None
 
-    created = http_post_json(
-        API_BASE_INT, "/inventory/v2/tenant/{tenant}/warehouses", it, payload
-    )
+    created = http_post_json(API_BASE_INT, "/inventory/v2/tenant/{tenant}/warehouses", it, payload)
     new_id = created.get("id") or created.get("warehouseId")
     if new_id is not None:
         db.put("warehouses", wid, str(new_id))
@@ -990,7 +973,12 @@ def _ensure_warehouse_integration(
 
 @cli.command("copy-po")
 @click.option("--id", "po_id", required=True, help="Production PO ID to copy")
-@click.option("--default-warehouse-id", type=int, default=None, help="Fallback Integration warehouse id if source warehouse is missing")
+@click.option(
+    "--default-warehouse-id",
+    type=int,
+    default=None,
+    help="Fallback Integration warehouse id if source warehouse is missing",
+)
 @click.option("--dry-run", is_flag=True, help="print payloads; don't POST")
 @click.option("--verbose", is_flag=True, help="verbose logging")
 def copy_po(po_id, default_warehouse_id, dry_run, verbose):
@@ -1000,7 +988,7 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
 
     try:
         ensure_env()
-        cfg = load_config()
+        _ = load_config()
     except Exception as e:
         print_error(f"Setup error: {e}")
         return
@@ -1022,7 +1010,7 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
 
     # Resolve vendor
     vendor_id = src.get("vendorId") or (src.get("vendor") or {}).get("id")
-    vendor_int_id: Optional[int] = None
+    vendor_int_id: int | None = None
     if vendor_id:
         try:
             vendor_int_id = _ensure_vendor_integration(int(vendor_id), pt, it, db, dry_run)
@@ -1033,7 +1021,7 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
     # Resolve warehouse (best-effort)
     warehouse_id = src.get("warehouseId") or (src.get("warehouse") or {}).get("id")
     warehouse_name = (src.get("warehouse") or {}).get("name") or ""
-    wh_int_id: Optional[int] = None
+    wh_int_id: int | None = None
     if warehouse_id:
         try:
             wh_int_id = _ensure_warehouse_integration(int(warehouse_id), pt, it, db, dry_run)
@@ -1049,8 +1037,8 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
 
     # Resolve line items → materials
     lines_src = src.get("items") or src.get("lines") or []
-    lines_payload: List[Dict[str, Any]] = []  # for Integration POST (items)
-    lines_payload_dry: List[Dict[str, Any]] = []
+    lines_payload: list[dict[str, Any]] = []  # for Integration POST (items)
+    lines_payload_dry: list[dict[str, Any]] = []
     for ln in lines_src:
         # Prefer explicit pricebook identifiers; never use the PO line's own id
         src_item_id = (
@@ -1064,12 +1052,7 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
             logger.warning("Skipping PO line with no item id", line=ln)
             continue
         try:
-            code_hint = (
-                ln.get("code")
-                or ln.get("itemCode")
-                or ln.get("skuCode")
-                or ln.get("sku")
-            )
+            code_hint = ln.get("code") or ln.get("itemCode") or ln.get("skuCode") or ln.get("sku")
             name_hint = ln.get("name") or ln.get("skuName") or ln.get("description")
             int_item_id = _ensure_material_integration(
                 int(src_item_id), pt, it, db, dry_run, code_hint, name_hint
@@ -1089,7 +1072,11 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
                 "unitCost": unit_cost,
                 "cost": unit_cost,
                 **({"description": name_hint} if name_hint else {}),
-                **({"vendorPartNumber": ln.get("vendorPartNumber")} if ln.get("vendorPartNumber") else {}),
+                **(
+                    {"vendorPartNumber": ln.get("vendorPartNumber")}
+                    if ln.get("vendorPartNumber")
+                    else {}
+                ),
             }
         )
         lines_payload_dry.append(
@@ -1103,7 +1090,7 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
 
     # Build Integration PO payload
     # Purchase Order Type (required by v2)
-    def _get_integration_po_type_id(bearer: str) -> Optional[int]:
+    def _get_integration_po_type_id(bearer: str) -> int | None:
         try:
             data = http_get(
                 API_BASE_INT,
@@ -1142,7 +1129,7 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
         return
 
     # Resolve Business Unit: prefer Production BU name mapped to Integration
-    bu_int_id: Optional[int] = None
+    bu_int_id: int | None = None
     # Try to get name from Production PO payload
     bu_name = None
     bu_obj = src.get("businessUnit") if isinstance(src.get("businessUnit"), dict) else None
@@ -1186,26 +1173,35 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
             addr_norm[k] = v
 
     po_body = {
-        "vendorId": int(vendor_int_id) if vendor_int_id is not None else int(vendor_id) if vendor_id else 0,
-        "date": src.get("createdOn") or src.get("orderedOn") or src.get("modifiedOn") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "vendorId": int(vendor_int_id)
+        if vendor_int_id is not None
+        else int(vendor_id)
+        if vendor_id
+        else 0,
+        "date": src.get("createdOn")
+        or src.get("orderedOn")
+        or src.get("modifiedOn")
+        or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "typeId": int(type_id),
         "externalNumber": f"PROD-{src.get('id') or po_id}",
         # Some tenants require both a top-level inventoryLocationId and shipTo object
         "inventoryLocationId": int(wh_int_id),
         "shipTo": {
             "inventoryLocationId": int(wh_int_id),
-            "description": wh_details.get("name") or wh_details.get("displayName") or "Ship to Integration Warehouse",
+            "description": wh_details.get("name")
+            or wh_details.get("displayName")
+            or "Ship to Integration Warehouse",
             "address": addr_norm,
         },
         "tax": 0,
         "shipping": 0,
-        "requiredOn": src.get("requiredOn") or src.get("expectedOn") or src.get("createdOn") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "requiredOn": src.get("requiredOn")
+        or src.get("expectedOn")
+        or src.get("createdOn")
+        or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "businessUnitId": int(bu_id) if bu_id else None,
         "impactsTechnicianPayroll": False,
-        "items": [
-            {k: v for k, v in itm.items() if v is not None}
-            for itm in lines_payload
-        ],
+        "items": [{k: v for k, v in itm.items() if v is not None} for itm in lines_payload],
     }
 
     # Drop None fields
@@ -1220,7 +1216,11 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
     try:
         # POST plain body (no wrapper) for purchase-orders
         created = http_post_json(
-            API_BASE_INT, "/inventory/v2/tenant/{tenant}/purchase-orders", it, po_body, allow_wrapper_retry=False
+            API_BASE_INT,
+            "/inventory/v2/tenant/{tenant}/purchase-orders",
+            it,
+            po_body,
+            allow_wrapper_retry=False,
         )
         int_po_id = created.get("id") or created.get("purchaseOrderId")
         if int_po_id:
@@ -1263,11 +1263,19 @@ def sync(kind, since, limit, dry_run, verbose):
 
         # Select mapper or specialized flow
         if kind == "items":
-            mapper = lambda src: map_item_for_create(src)
+
+            def item_mapper(src):
+                return map_item_for_create(src)
+
+            mapper = item_mapper
         elif kind == "pos":
             mapper = None  # handled by v2 flow below
         elif kind == "jobs":
-            mapper = lambda src: map_job_for_create(src, db.get)
+
+            def job_mapper(src):
+                return map_job_for_create(src, db.get)
+
+            mapper = job_mapper
         else:
             print_error(f"Unsupported kind: {kind}")
             return
@@ -1280,12 +1288,10 @@ def sync(kind, since, limit, dry_run, verbose):
         print_msg(f"Syncing {kind}...")
 
         # Pre-fetch optional constants
-        po_type_id_cache: Optional[int] = None
+        po_type_id_cache: int | None = None
 
         for src in fetch_all(ent, API_BASE_PROD, pt, since):
-            prod_id = str(
-                src.get("id") or src.get("guid") or src.get("externalId") or ""
-            )
+            prod_id = str(src.get("id") or src.get("guid") or src.get("externalId") or "")
             if not prod_id:
                 logger.warning("Skipping record with no ID", source_data=src)
                 continue
@@ -1315,9 +1321,7 @@ def sync(kind, since, limit, dry_run, verbose):
                         if int_id:
                             db.put(kind, prod_id, int_id)
                             created += 1
-                            logger.info(
-                                "Created record", kind=kind, prod_id=prod_id, int_id=int_id
-                            )
+                            logger.info("Created record", kind=kind, prod_id=prod_id, int_id=int_id)
                         else:
                             print_msg(f"Warning: no id returned for Prod {prod_id}")
                             errors += 1
@@ -1325,16 +1329,20 @@ def sync(kind, since, limit, dry_run, verbose):
                     # v2 Purchase Order flow
                     # Ensure vendor
                     vendor_id = src.get("vendorId") or (src.get("vendor") or {}).get("id")
-                    vendor_int_id: Optional[int] = None
+                    vendor_int_id: int | None = None
                     if vendor_id:
-                        vendor_int_id = _ensure_vendor_integration(int(vendor_id), pt, it, db, dry_run)
+                        vendor_int_id = _ensure_vendor_integration(
+                            int(vendor_id), pt, it, db, dry_run
+                        )
 
                     # Ensure warehouse (from id or name, else env/default)
                     warehouse_id = src.get("warehouseId") or (src.get("warehouse") or {}).get("id")
                     warehouse_name = (src.get("warehouse") or {}).get("name") or ""
-                    wh_int_id: Optional[int] = None
+                    wh_int_id: int | None = None
                     if warehouse_id:
-                        wh_int_id = _ensure_warehouse_integration(int(warehouse_id), pt, it, db, dry_run)
+                        wh_int_id = _ensure_warehouse_integration(
+                            int(warehouse_id), pt, it, db, dry_run
+                        )
                     if wh_int_id is None and warehouse_name:
                         wh_int_id = _find_integration_warehouse_by_name(warehouse_name, it)
                     if wh_int_id is None:
@@ -1343,8 +1351,12 @@ def sync(kind, since, limit, dry_run, verbose):
                             wh_int_id = int(env_wh)
 
                     # Resolve BU
-                    bu_int_id: Optional[int] = None
-                    bu_obj = src.get("businessUnit") if isinstance(src.get("businessUnit"), dict) else None
+                    bu_int_id: int | None = None
+                    bu_obj = (
+                        src.get("businessUnit")
+                        if isinstance(src.get("businessUnit"), dict)
+                        else None
+                    )
                     bu_name = bu_obj.get("name") if bu_obj else None
                     bu_id_prod = src.get("businessUnitId") or (bu_obj or {}).get("id")
                     if not bu_name and bu_id_prod:
@@ -1358,7 +1370,7 @@ def sync(kind, since, limit, dry_run, verbose):
 
                     # Items → ensure materials + build items[]
                     lines_src = src.get("items") or src.get("lines") or []
-                    items_payload: List[Dict[str, Any]] = []
+                    items_payload: list[dict[str, Any]] = []
                     for ln in lines_src:
                         src_item_id = (
                             ln.get("itemId")
@@ -1390,7 +1402,11 @@ def sync(kind, since, limit, dry_run, verbose):
                                 "unitCost": unit_cost,
                                 "cost": unit_cost,
                                 **({"description": name_hint} if name_hint else {}),
-                                **({"vendorPartNumber": ln.get("vendorPartNumber")} if ln.get("vendorPartNumber") else {}),
+                                **(
+                                    {"vendorPartNumber": ln.get("vendorPartNumber")}
+                                    if ln.get("vendorPartNumber")
+                                    else {}
+                                ),
                             }
                         )
 
@@ -1409,12 +1425,16 @@ def sync(kind, since, limit, dry_run, verbose):
 
                     # Warehouse needed
                     if not wh_int_id:
-                        print_error("No Integration warehouse id resolved; set ST_DEFAULT_WAREHOUSE_ID_INT")
+                        print_error(
+                            "No Integration warehouse id resolved; set ST_DEFAULT_WAREHOUSE_ID_INT"
+                        )
                         errors += 1
                         continue
 
                     # Warehouse details for shipTo
-                    wh_details = _get_integration_warehouse_info(int(wh_int_id), it) if wh_int_id else {}
+                    wh_details = (
+                        _get_integration_warehouse_info(int(wh_int_id), it) if wh_int_id else {}
+                    )
                     addr_env = {
                         "street": os.getenv("ST_SHIPTO_STREET", ""),
                         "unit": os.getenv("ST_SHIPTO_UNIT", ""),
@@ -1429,24 +1449,35 @@ def sync(kind, since, limit, dry_run, verbose):
                             addr_norm[k] = v
 
                     po_body = {
-                        "vendorId": int(vendor_int_id) if vendor_int_id is not None else int(vendor_id) if vendor_id else 0,
-                        "date": src.get("createdOn") or src.get("orderedOn") or src.get("modifiedOn") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "vendorId": int(vendor_int_id)
+                        if vendor_int_id is not None
+                        else int(vendor_id)
+                        if vendor_id
+                        else 0,
+                        "date": src.get("createdOn")
+                        or src.get("orderedOn")
+                        or src.get("modifiedOn")
+                        or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "typeId": int(po_type_id_cache),
                         "externalNumber": f"PROD-{src.get('id') or prod_id}",
                         "inventoryLocationId": int(wh_int_id),
                         "shipTo": {
                             "inventoryLocationId": int(wh_int_id),
-                            "description": wh_details.get("name") or wh_details.get("displayName") or "Ship to Integration Warehouse",
+                            "description": wh_details.get("name")
+                            or wh_details.get("displayName")
+                            or "Ship to Integration Warehouse",
                             "address": addr_norm,
                         },
                         "tax": 0,
                         "shipping": 0,
-                        "requiredOn": src.get("requiredOn") or src.get("expectedOn") or src.get("createdOn") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "requiredOn": src.get("requiredOn")
+                        or src.get("expectedOn")
+                        or src.get("createdOn")
+                        or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "businessUnitId": int(bu_int_id) if bu_int_id else None,
                         "impactsTechnicianPayroll": False,
                         "items": [
-                            {k: v for k, v in itm.items() if v is not None}
-                            for itm in items_payload
+                            {k: v for k, v in itm.items() if v is not None} for itm in items_payload
                         ],
                     }
                     po_body = {k: v for k, v in po_body.items() if v is not None}

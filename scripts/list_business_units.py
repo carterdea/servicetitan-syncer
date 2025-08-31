@@ -7,7 +7,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from stsync import int_token, http_get, API_BASE_INT
+from stsync import API_BASE_INT, http_get, int_token  # noqa: E402
 
 
 def main() -> None:
