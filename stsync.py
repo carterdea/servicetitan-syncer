@@ -740,23 +740,6 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
 
     # Build Integration PO payload
     # Purchase Order Type (required by v2)
-    def _get_integration_po_type_id(bearer: str) -> int | None:
-        try:
-            data = http_get(
-                API_BASE_INT,
-                "/inventory/v2/tenant/{tenant}/purchase-order-types",
-                bearer,
-                {"page": 1, "pageSize": 200},
-            )
-            kinds = data.get("data") or data.get("items") or []
-            for k in kinds:
-                nm = (k.get("name") or "").lower()
-                if "stock" in nm or "inventory" in nm:
-                    return k.get("id")
-            return kinds[0].get("id") if kinds else None
-        except Exception:
-            return None
-
     type_id = _get_integration_po_type_id(it)
     if not type_id:
         print_error("Could not determine a purchase order typeId in Integration")
