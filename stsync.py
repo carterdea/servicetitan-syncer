@@ -31,7 +31,7 @@ from pydantic import ValidationError
 from stsync_auth import int_token, prod_token
 from stsync_config import load_config
 from stsync_db import IDMapper
-from stsync_http import fetch_all, http_get, http_post_json
+from stsync_http import fetch_all, get_integration_po_type_id, http_get, http_post_json
 from stsync_models import ItemCreate, JobCreate, POCreate, POLineCreate
 from stsync_settings import get_settings, missing_required_keys, require_settings
 
@@ -554,22 +554,7 @@ def _get_integration_warehouse_info(wh_id: int, it: str) -> dict[str, Any]:
     return {}
 
 
-def _get_integration_po_type_id(bearer: str) -> int | None:
-    try:
-        data = http_get(
-            API_BASE_INT,
-            "/inventory/v2/tenant/{tenant}/purchase-order-types",
-            bearer,
-            {"page": 1, "pageSize": 200},
-        )
-        kinds = data.get("data") or data.get("items") or []
-        for k in kinds:
-            nm = (k.get("name") or "").lower()
-            if "stock" in nm or "inventory" in nm:
-                return k.get("id")
-        return kinds[0].get("id") if kinds else None
-    except Exception:
-        return None
+# moved to stsync_http.get_integration_po_type_id
 
 
 def _ensure_warehouse_integration(
@@ -740,7 +725,7 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
 
     # Build Integration PO payload
     # Purchase Order Type (required by v2)
-    type_id = _get_integration_po_type_id(it)
+    type_id = get_integration_po_type_id(it)
     if not type_id:
         print_error("Could not determine a purchase order typeId in Integration")
         return
@@ -1050,7 +1035,7 @@ def sync(kind, since, limit, dry_run, verbose):
 
                     # PO type id (cache)
                     if po_type_id_cache is None:
-                        po_type_id_cache = _get_integration_po_type_id(it)
+                        po_type_id_cache = get_integration_po_type_id(it)
                     if not po_type_id_cache:
                         print_error("Could not determine a purchase order typeId in Integration")
                         errors += 1
