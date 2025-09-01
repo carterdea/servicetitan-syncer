@@ -21,23 +21,19 @@ Usage:
 import json
 import logging
 import os
-import sqlite3
 import time
-from collections.abc import Iterable
-from pathlib import Path
 from typing import Any
 
 import click
-import httpx
 import structlog
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential_jitter,
-)
+from pydantic import ValidationError
+
+from stsync_auth import int_token, prod_token
+from stsync_config import load_config
+from stsync_db import IDMapper
+from stsync_http import fetch_all, http_get, http_post_json
+from stsync_models import ItemCreate, JobCreate, POCreate, POLineCreate
+from stsync_settings import get_settings, missing_required_keys, require_settings
 
 # Configure structured logging
 logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[logging.StreamHandler()])
@@ -57,376 +53,39 @@ def print_success(msg):
     print(f"SUCCESS: {msg}")
 
 
-# ---------- Pydantic Models ----------
-class ItemCreate(BaseModel):
-    code: str
-    name: str
-    description: str | None = None
-    active: bool = True
+# ---------- (moved) Pydantic Models ----------
+# Models are now in stsync_models.py and imported above.
 
 
-class POLineCreate(BaseModel):
-    itemId: int
-    quantity: float
-    unitCost: float | None = None
+# ---------- Environment Variables (via Pydantic Settings) ----------
+_raw = get_settings()
+AUTH_URL_PROD = _raw.AUTH_URL_PROD
+AUTH_URL_INT = _raw.AUTH_URL_INT
+API_BASE_PROD = _raw.API_BASE_PROD
+API_BASE_INT = _raw.API_BASE_INT
+CLIENT_ID_PROD = _raw.CLIENT_ID_PROD
+CLIENT_SECRET_PROD = _raw.CLIENT_SECRET_PROD
+CLIENT_ID_INT = _raw.CLIENT_ID_INT
+CLIENT_SECRET_INT = _raw.CLIENT_SECRET_INT
+TENANT_ID_PROD = _raw.TENANT_ID_PROD
+TENANT_ID_INT = _raw.TENANT_ID_INT
+APP_KEY_PROD = _raw.APP_KEY_PROD
+APP_KEY_INT = _raw.APP_KEY_INT
+DB_PATH = _raw.DB_PATH
+PAGE_SIZE_DEFAULT = _raw.PAGE_SIZE_DEFAULT
+HTTP_TIMEOUT = _raw.HTTP_TIMEOUT
 
 
-class POCreate(BaseModel):
-    vendorId: int
-    warehouseId: int | None = None
-    externalNumber: str
-    lines: list[POLineCreate] = Field(default_factory=list)
+# Config loader and URL helper have been moved to modules.
 
 
-class JobCreate(BaseModel):
-    customerId: int
-    locationId: int
-    jobTypeId: int
-    campaignId: int | None = None
-    source: str = "stsync"
-    externalNumber: str
-    notes: str
+# IDMapper is now in stsync_db.py
 
 
-class APIResponse(BaseModel):
-    id: int | None = None
-    guid: str | None = None
-    externalId: str | None = None
+# OAuth helpers moved to stsync_auth.py
 
 
-class VendorCreate(BaseModel):
-    name: str
-    externalNumber: str | None = None
-
-
-class WarehouseCreate(BaseModel):
-    name: str
-    externalNumber: str | None = None
-
-
-# ---------- Environment Variables ----------
-load_dotenv()
-AUTH_URL_PROD = os.getenv("ST_AUTH_URL_PROD")
-AUTH_URL_INT = os.getenv("ST_AUTH_URL_INT")
-API_BASE_PROD = os.getenv("ST_API_BASE_PROD")
-API_BASE_INT = os.getenv("ST_API_BASE_INT")
-CLIENT_ID_PROD = os.getenv("ST_CLIENT_ID_PROD")
-CLIENT_SECRET_PROD = os.getenv("ST_CLIENT_SECRET_PROD")
-CLIENT_ID_INT = os.getenv("ST_CLIENT_ID_INT")
-CLIENT_SECRET_INT = os.getenv("ST_CLIENT_SECRET_INT")
-TENANT_ID_PROD = os.getenv("ST_TENANT_ID_PROD")
-TENANT_ID_INT = os.getenv("ST_TENANT_ID_INT")
-# App Keys (ServiceTitan v2 APIs)
-APP_KEY_PROD = os.getenv("ST_APP_KEY_PROD") or os.getenv("ST_APP_KEY")
-APP_KEY_INT = os.getenv("ST_APP_KEY_INT") or os.getenv("ST_APP_KEY")
-DB_PATH = os.getenv("STSYNC_DB", "stsync.sqlite3")
-PAGE_SIZE_DEFAULT = int(os.getenv("ST_PAGE_SIZE", "200"))
-HTTP_TIMEOUT = int(os.getenv("ST_HTTP_TIMEOUT", "30"))
-
-
-# ---------- Configuration ----------
-def load_config() -> dict[str, Any]:
-    config_path = Path("stsync.config.json")
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-# ---------- URL helper ----------
-def build_url(base: str, path: str, tenant_id: str) -> str:
-    """Build full URL; replace optional {tenant} placeholder with tenant_id."""
-    if "{tenant}" in path:
-        path = path.replace("{tenant}", str(tenant_id))
-    return f"{base.rstrip('/')}/{path.lstrip('/')}"
-
-
-# ---------- Database (ID crosswalk) ----------
-class IDMapper:
-    def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
-        self._init_db()
-
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as cx:
-            cx.execute("""CREATE TABLE IF NOT EXISTS id_map(
-                kind TEXT NOT NULL,
-                prod_id TEXT NOT NULL,
-                int_id TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                PRIMARY KEY(kind, prod_id)
-            )""")
-
-    def get(self, kind: str, prod_id: str) -> str | None:
-        with sqlite3.connect(self.db_path) as cx:
-            cur = cx.execute(
-                "SELECT int_id FROM id_map WHERE kind=? AND prod_id=?", (kind, prod_id)
-            )
-            r = cur.fetchone()
-            return r[0] if r else None
-
-    def put(self, kind: str, prod_id: str, int_id: str) -> None:
-        with sqlite3.connect(self.db_path) as cx:
-            cx.execute(
-                "INSERT OR REPLACE INTO id_map(kind, prod_id, int_id, created_at) VALUES(?,?,?,?)",
-                (kind, prod_id, int_id, time.time()),
-            )
-            cx.commit()
-
-    def exists(self, kind: str, prod_id: str) -> bool:
-        return self.get(kind, prod_id) is not None
-
-
-# ---------- OAuth ----------
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential_jitter(1, 5),
-    retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError)),
-)
-def token(auth_url: str, client_id: str, client_secret: str, scope: str = "") -> str:
-    # Determine environment from URL for better error messages
-    if "integration" in auth_url:
-        env_name = "Integration"
-    else:
-        env_name = "Production"
-
-    logger.info(f"Fetching OAuth token for {env_name}", url=auth_url)
-    data = {"grant_type": "client_credentials"}
-    if scope:
-        data["scope"] = scope
-
-    try:
-        r = httpx.post(auth_url, data=data, auth=(client_id, client_secret), timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        return r.json()["access_token"]
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
-            logger.warning(
-                f"Rate limited for {env_name}, backing off",
-                status_code=e.response.status_code,
-            )
-            raise  # Let tenacity handle retry
-        logger.error(
-            f"{env_name} auth failed",
-            status_code=e.response.status_code,
-            response=e.response.text,
-        )
-        # Create a more descriptive error
-        error_msg = f"{env_name} authentication failed: {e.response.text}"
-        if "invalid_client" in e.response.text:
-            error_msg += f"\nCheck your {env_name} CLIENT_ID and CLIENT_SECRET"
-        raise RuntimeError(error_msg) from e
-    except Exception as e:
-        logger.error(f"{env_name} auth error", error=str(e))
-        raise RuntimeError(f"{env_name} authentication error: {str(e)}") from e
-
-
-def prod_token() -> str:
-    return token(AUTH_URL_PROD, CLIENT_ID_PROD, CLIENT_SECRET_PROD)
-
-
-def int_token() -> str:
-    return token(AUTH_URL_INT, CLIENT_ID_INT, CLIENT_SECRET_INT)
-
-
-# ---------- HTTP helpers ----------
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential_jitter(1, 5),
-    retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError)),
-)
-def http_get(base: str, path: str, bearer: str, params: dict[str, Any]) -> dict[str, Any]:
-    # Determine env-specific values
-    if base == API_BASE_PROD:
-        tenant_id = TENANT_ID_PROD
-        app_key = APP_KEY_PROD
-        env_name = "Production"
-    elif base == API_BASE_INT:
-        tenant_id = TENANT_ID_INT
-        app_key = APP_KEY_INT
-        env_name = "Integration"
-    else:
-        raise ValueError(f"Unknown API base: {base}")
-
-    url = build_url(base, path, tenant_id)
-    logger.debug("Making GET request", url=url, params=params)
-
-    try:
-        headers = {
-            "Authorization": f"Bearer {bearer}",
-            # v2 APIs require App Key; tenant is in path
-            "ST-App-Key": app_key,
-        }
-        r = httpx.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=HTTP_TIMEOUT,
-        )
-
-        if r.status_code == 429:
-            logger.warning("Rate limited, backing off", url=url, status_code=r.status_code)
-            raise httpx.HTTPStatusError("Rate limited", request=r.request, response=r)
-        elif r.status_code >= 500:
-            logger.error("Server error", url=url, status_code=r.status_code, response=r.text)
-            raise RuntimeError(f"GET {url} -> {r.status_code}")
-
-        r.raise_for_status()
-        return r.json()
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "HTTP error",
-            url=url,
-            status_code=e.response.status_code,
-            response=e.response.text[:500],
-            env=env_name,
-        )
-        raise
-    except Exception as e:
-        logger.error("Request error", url=url, error=str(e))
-        raise
-
-
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential_jitter(1, 5),
-    retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError)),
-)
-def http_post_json(
-    base: str,
-    path: str,
-    bearer: str,
-    payload: dict[str, Any],
-    allow_wrapper_retry: bool = True,
-) -> dict[str, Any]:
-    # Determine env-specific values
-    if base == API_BASE_PROD:
-        tenant_id = TENANT_ID_PROD
-        app_key = APP_KEY_PROD
-        env_name = "Production"
-    elif base == API_BASE_INT:
-        tenant_id = TENANT_ID_INT
-        app_key = APP_KEY_INT
-        env_name = "Integration"
-    else:
-        raise ValueError(f"Unknown API base: {base}")
-
-    url = build_url(base, path, tenant_id)
-    logger.debug("Making POST request", url=url, payload_keys=list(payload.keys()))
-
-    try:
-        headers = {
-            "Authorization": f"Bearer {bearer}",
-            "Content-Type": "application/json",
-            # v2 APIs require App Key; tenant is in path
-            "ST-App-Key": app_key,
-        }
-        r = httpx.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
-
-        if r.status_code == 429:
-            logger.warning("Rate limited, backing off", url=url, status_code=r.status_code)
-            raise httpx.HTTPStatusError("Rate limited", request=r.request, response=r)
-        # Do not retry on other 4xx client errors
-        if 400 <= r.status_code < 500:
-            logger.error(
-                "Client error on POST",
-                url=url,
-                status_code=r.status_code,
-                response=r.text[:500],
-                env=env_name,
-            )
-            # Some ST endpoints expect a {"request": {...}} wrapper. Retry once with wrapper.
-            if allow_wrapper_retry and "request" in (r.text or "").lower():
-                try:
-                    wrapped = {"request": payload}
-                    logger.info("Retrying POST with request wrapper", url=url)
-                    r2 = httpx.post(url, headers=headers, json=wrapped, timeout=HTTP_TIMEOUT)
-                    r2.raise_for_status()
-                    try:
-                        return r2.json()
-                    except Exception:
-                        return {}
-                except Exception:
-                    pass
-            raise RuntimeError(f"POST {url} -> {r.status_code}: {r.text[:200]}")
-
-        r.raise_for_status()
-
-        try:
-            return r.json()
-        except Exception:
-            logger.warning("No JSON response from POST", url=url, status_code=r.status_code)
-            return {}
-
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "HTTP POST error",
-            url=url,
-            status_code=e.response.status_code,
-            response=e.response.text[:500],
-            env=env_name,
-        )
-        raise
-    except Exception as e:
-        logger.error("POST request error", url=url, error=str(e))
-        raise
-
-
-def fetch_all(
-    cfg: dict[str, Any], base: str, bearer: str, since: str | None
-) -> Iterable[dict[str, Any]]:
-    params = dict(cfg.get("list_params") or {})
-    if "pageSize" in params and not params["pageSize"]:
-        params["pageSize"] = PAGE_SIZE_DEFAULT
-
-    since_param = cfg.get("since_param")
-    if since and since_param:
-        params[since_param] = since
-
-    list_key = cfg.get("list_data_key") or "items"
-    next_key = cfg.get("next_page_key") or "hasMore"
-    path = cfg["prod_list_path"]
-
-    page_count = 0
-    total_items = 0
-
-    while True:
-        page_count += 1
-        data = http_get(base, path, bearer, params)
-        items = data.get(list_key) or []
-
-        logger.info(
-            "Fetched page",
-            page=page_count,
-            item_count=len(items),
-            total_so_far=total_items,
-        )
-
-        for it in items:
-            total_items += 1
-            yield it
-
-        # Pagination handling variants
-        if "hasMore" in data:
-            if data.get("hasMore"):
-                params["page"] = int(params.get("page", 1)) + 1
-                continue
-            else:
-                break
-
-        next_page = data.get(next_key)
-        if isinstance(next_page, int):
-            params["page"] = next_page
-            continue
-        if isinstance(next_page, str) and next_page:
-            params["continuationToken"] = next_page
-            continue
-
-        # Fallback: advance if page appears full
-        if "page" in params and "pageSize" in params and len(items) >= int(params["pageSize"]):
-            params["page"] = int(params["page"]) + 1
-            continue
-        break
+# HTTP helpers now live in stsync_http.py
 
 
 # ---------- Field mappers (with Pydantic validation) ----------
@@ -540,26 +199,17 @@ def map_job_for_create(src: dict[str, Any], xlate) -> dict[str, Any]:
 # ---------- CLI helpers ----------
 def ensure_env():
     """Validate required environment variables"""
-    required = [
-        ("ST_AUTH_URL_PROD", AUTH_URL_PROD),
-        ("ST_AUTH_URL_INT", AUTH_URL_INT),
-        ("ST_API_BASE_PROD", API_BASE_PROD),
-        ("ST_API_BASE_INT", API_BASE_INT),
-        ("ST_CLIENT_ID_PROD", CLIENT_ID_PROD),
-        ("ST_CLIENT_SECRET_PROD", CLIENT_SECRET_PROD),
-        ("ST_CLIENT_ID_INT", CLIENT_ID_INT),
-        ("ST_CLIENT_SECRET_INT", CLIENT_SECRET_INT),
-        ("ST_TENANT_ID_PROD", TENANT_ID_PROD),
-        ("ST_TENANT_ID_INT", TENANT_ID_INT),
-        ("ST_APP_KEY_PROD or ST_APP_KEY", APP_KEY_PROD),
-        ("ST_APP_KEY_INT or ST_APP_KEY", APP_KEY_INT),
-    ]
-
-    missing = [k for k, v in required if not v]
+    missing = missing_required_keys()
     if missing:
         print_error(f"Missing environment variables: {', '.join(missing)}")
         print_msg("Copy env.example to .env and fill in the values")
         raise click.ClickException("Missing required environment variables")
+    # Type validation via Pydantic
+    try:
+        _ = require_settings()
+    except Exception as e:
+        print_error(f"Invalid environment configuration: {e}")
+        raise click.ClickException("Invalid environment configuration") from e
 
 
 @click.group()
