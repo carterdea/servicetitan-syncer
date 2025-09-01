@@ -132,8 +132,12 @@ def http_post_json(
                         return r2.json()
                     except Exception:
                         return {}
-                except Exception:
-                    pass
+                except Exception as wrap_err:
+                    logger.warning(
+                        "POST wrapper retry failed",
+                        url=url,
+                        error=str(wrap_err),
+                    )
             raise RuntimeError(f"POST {url} -> {r.status_code}: {r.text[:200]}")
 
         r.raise_for_status()
@@ -212,3 +216,26 @@ def fetch_all(
             params["page"] = int(params["page"]) + 1
             continue
         break
+
+
+def get_integration_po_type_id(bearer: str) -> int | None:
+    """Return a suitable Integration purchase-order type id (e.g., stock/inventory), or first.
+
+    Relies on settings for API base and tenant.
+    """
+    s = require_settings()
+    try:
+        data = http_get(
+            s.API_BASE_INT,
+            "/inventory/v2/tenant/{tenant}/purchase-order-types",
+            bearer,
+            {"page": 1, "pageSize": 200},
+        )
+        kinds = data.get("data") or data.get("items") or []
+        for k in kinds:
+            nm = (k.get("name") or "").lower()
+            if "stock" in nm or "inventory" in nm:
+                return k.get("id")
+        return kinds[0].get("id") if kinds else None
+    except Exception:
+        return None

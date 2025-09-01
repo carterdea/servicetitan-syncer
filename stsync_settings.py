@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -82,6 +83,18 @@ _cache: RawSettings | None = None
 
 
 def _read_env_dict() -> dict:
+    logger = logging.getLogger(__name__)
+
+    def _safe_int_env(key: str) -> int | None:
+        val = os.getenv(key)
+        if not val:
+            return None
+        try:
+            return int(val)
+        except ValueError:
+            logger.warning("Invalid integer value for %s: %s", key, val)
+            return None
+
     # Support global fallback for ST_APP_KEY_*
     app_key_global = os.getenv("ST_APP_KEY")
     return {
@@ -107,15 +120,9 @@ def _read_env_dict() -> dict:
         "PAGE_SIZE_DEFAULT": int(os.getenv("ST_PAGE_SIZE", "200")),
         "HTTP_TIMEOUT": int(os.getenv("ST_HTTP_TIMEOUT", "30")),
         # Optional fallbacks
-        "ST_DEFAULT_WAREHOUSE_ID_INT": (
-            int(os.getenv("ST_DEFAULT_WAREHOUSE_ID_INT"))
-            if os.getenv("ST_DEFAULT_WAREHOUSE_ID_INT")
-            else None
-        ),
-        "ST_DEFAULT_BUSINESS_UNIT_ID_INT": (
-            int(os.getenv("ST_DEFAULT_BUSINESS_UNIT_ID_INT"))
-            if os.getenv("ST_DEFAULT_BUSINESS_UNIT_ID_INT")
-            else None
+        "ST_DEFAULT_WAREHOUSE_ID_INT": _safe_int_env("ST_DEFAULT_WAREHOUSE_ID_INT"),
+        "ST_DEFAULT_BUSINESS_UNIT_ID_INT": _safe_int_env(
+            "ST_DEFAULT_BUSINESS_UNIT_ID_INT"
         ),
         # Optional ship-to
         "ST_SHIPTO_STREET": os.getenv("ST_SHIPTO_STREET"),
