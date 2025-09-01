@@ -9,6 +9,7 @@
 - ✅ SQLite ID crosswalk: (kind, prod_id) → integration_id
 - ✅ Robust pagination, retries, dry-run, since filter, limit
 - ✅ Pydantic data validation for API payloads
+- ✅ Pydantic-validated env + config models
 - ✅ Structured logging with Rich console output
 - ✅ Rate limiting protection
 - ✅ Idempotent operations (skips already-synced records)
@@ -147,6 +148,19 @@ Adjust paths and pagination keys to match your ServiceTitan tenant:
 Notes:
 - Endpoints use the v2 shape: `/<domain>/v2/tenant/{tenant}/...` and the `{tenant}` placeholder is replaced from `.env`.
 - The client now sends the required `ST-App-Key` header. Be sure to set `ST_APP_KEY_*`.
+
+## Architecture
+
+Low‑risk refactor extracted core modules while preserving the `stsync.py` CLI:
+
+- `stsync_settings.py`: Pydantic settings loader and validators
+- `stsync_config.py`: Pydantic schema + loader for `stsync.config.json`
+- `stsync_http.py`: HTTP helpers (`http_get`, `http_post_json`, `fetch_all`, `build_url`)
+- `stsync_auth.py`: OAuth helpers (`token`, `prod_token`, `int_token`)
+- `stsync_db.py`: SQLite ID crosswalk (`IDMapper`)
+- `stsync_models.py`: Pydantic payload models
+
+Backwards compatibility: `stsync.py` still exposes `API_BASE_INT`, `http_get`, and `int_token` for existing scripts.
 
 ## ID Mapping
 
