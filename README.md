@@ -219,6 +219,14 @@ Use `--verbose` flag for detailed logging:
 uv run stsync sync items --verbose --limit 1
 ```
 
+## Type Checking
+
+- Install dev deps (once): `uv sync`
+- Run mypy: `uv run mypy .`
+
+Notes:
+- We enable stricter options (e.g., `disallow_untyped_defs`, `no_implicit_optional`).
+
 ## Safety Features
 
 - **Dry-run mode**: Test without creating records

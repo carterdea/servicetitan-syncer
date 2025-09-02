@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 import click
 import structlog
@@ -41,15 +41,15 @@ logger = structlog.get_logger()
 
 
 # Simple console for output
-def print_msg(msg):
+def print_msg(msg: str) -> None:
     print(msg)
 
 
-def print_error(msg):
+def print_error(msg: str) -> None:
     print(f"ERROR: {msg}")
 
 
-def print_success(msg):
+def print_success(msg: str) -> None:
     print(f"SUCCESS: {msg}")
 
 
@@ -104,7 +104,9 @@ def map_item_for_create(src: dict[str, Any]) -> dict[str, Any]:
         raise
 
 
-def map_po_for_create(src: dict[str, Any], xlate) -> dict[str, Any]:
+def map_po_for_create(
+    src: dict[str, Any], xlate: Callable[[str, str], str | None]
+) -> dict[str, Any]:
     """Map production PO to integration create payload"""
     lines = []
     for ln in src.get("lines") or []:
@@ -145,9 +147,9 @@ def map_po_for_create(src: dict[str, Any], xlate) -> dict[str, Any]:
             vendorId=vendor_id,
             # Try to map warehouse if present; else omit so API chooses default if allowed
             warehouseId=(
-                int(xlate("warehouses", str(src.get("warehouseId"))))
-                if (src.get("warehouseId") and xlate("warehouses", str(src.get("warehouseId"))))
-                else None
+                (lambda v: (int(v) if v is not None else None))(
+                    xlate("warehouses", str(src.get("warehouseId"))) if src.get("warehouseId") else None
+                )
             ),
             externalNumber=f"PROD-{src.get('id')}",
             lines=lines,
@@ -158,7 +160,9 @@ def map_po_for_create(src: dict[str, Any], xlate) -> dict[str, Any]:
         raise
 
 
-def map_job_for_create(src: dict[str, Any], xlate) -> dict[str, Any]:
+def map_job_for_create(
+    src: dict[str, Any], xlate: Callable[[str, str], str | None]
+) -> dict[str, Any]:
     """Map production job to integration create payload"""
     try:
         cust_id = src.get("customerId")
@@ -197,7 +201,7 @@ def map_job_for_create(src: dict[str, Any], xlate) -> dict[str, Any]:
 
 
 # ---------- CLI helpers ----------
-def ensure_env():
+def ensure_env() -> None:
     """Validate required environment variables"""
     missing = missing_required_keys()
     if missing:
@@ -213,13 +217,13 @@ def ensure_env():
 
 
 @click.group()
-def cli():
+def cli() -> None:
     """ServiceTitan Prod → Integration copier (Jobs, Items, POs)"""
     pass
 
 
 @cli.command()
-def verify():
+def verify() -> None:
     """Check env, config, and authenticate to both envs."""
     print_msg("Verifying setup...")
 
@@ -253,7 +257,7 @@ def verify():
     # Test basic API call
     try:
         ent = cfg["entities"]["items"]
-        _ = http_get(API_BASE_PROD, ent["prod_list_path"], pt, {"page": 1, "pageSize": 1})
+        _ = http_get(require_settings().API_BASE_PROD, ent["prod_list_path"], pt, {"page": 1, "pageSize": 1})
         print_success("Production API connection OK")
     except Exception as e:
         print_error(f"Production API test failed: {e}")
@@ -262,11 +266,37 @@ def verify():
     print_success("All checks passed! Ready to sync.")
 
 
-def _get_prod_po_by_id(po_id: str, bearer: str) -> dict[str, Any]:
-    """Fetch a single Purchase Order from Production by ID (v2 path)."""
-    # Common v2 path
-    path = f"/inventory/v2/tenant/{{tenant}}/purchase-orders/{po_id}"
-    return http_get(API_BASE_PROD, path, bearer, params={})
+def _get_prod_po_by_identifier(identifier: str, bearer: str) -> dict[str, Any]:
+    """Fetch a Production PO by numeric ID or by PO number/external number.
+
+    - If `identifier` is digits-only, try direct GET by ID.
+    - Otherwise, or on failure, scan the list endpoint and match by `number` or `externalNumber`.
+    """
+    s = require_settings()
+
+    # Try direct by ID when numeric
+    if identifier.isdigit():
+        try:
+            path = f"/inventory/v2/tenant/{{tenant}}/purchase-orders/{identifier}"
+            return http_get(s.API_BASE_PROD, path, bearer, params={})
+        except Exception:
+            pass
+
+    # Fallback: list and match by number/externalNumber
+    cfg = {
+        "prod_list_path": "/inventory/v2/tenant/{tenant}/purchase-orders",
+        "list_params": {"page": 1, "pageSize": 200},
+        "list_data_key": "data",
+        "next_page_key": "hasMore",
+    }
+    ident = identifier.strip()
+    for po in fetch_all(cfg, s.API_BASE_PROD, bearer, since=None):
+        num = po.get("number") or po.get("purchaseOrderNumber") or po.get("poNumber")
+        ext = po.get("externalNumber") or po.get("externalId")
+        if str(num) == ident or str(ext) == ident:
+            return po
+
+    raise RuntimeError(f"Purchase Order not found by id or number: {identifier}")
 
 
 def _ensure_vendor_integration(
@@ -281,7 +311,8 @@ def _ensure_vendor_integration(
             return None
 
     # Fetch from Prod
-    v = http_get(API_BASE_PROD, f"/inventory/v2/tenant/{{tenant}}/vendors/{vendor_id}", pt, {})
+    s = require_settings()
+    v = http_get(s.API_BASE_PROD, f"/inventory/v2/tenant/{{tenant}}/vendors/{vendor_id}", pt, {})
     v_name = v.get("name") or v.get("displayName") or f"Vendor {vendor_id}"
     # Try Integration lookup by name to avoid duplicate vendor creation
     try:
@@ -318,7 +349,7 @@ def _ensure_vendor_integration(
         logger.info("DRY RUN - Would create vendor", payload=payload)
         return None
 
-    created = http_post_json(API_BASE_INT, "/inventory/v2/tenant/{tenant}/vendors", it, payload)
+    created = http_post_json(require_settings().API_BASE_INT, "/inventory/v2/tenant/{tenant}/vendors", it, payload)
     new_id = created.get("id") or created.get("vendorId")
     if new_id is not None:
         db.put("vendors", vid, str(new_id))
@@ -345,7 +376,12 @@ def _ensure_material_integration(
 
     # Try fetch as material
     try:
-        m = http_get(API_BASE_PROD, f"/pricebook/v2/tenant/{{tenant}}/materials/{item_id}", pt, {})
+        m = http_get(
+            require_settings().API_BASE_PROD,
+            f"/pricebook/v2/tenant/{{tenant}}/materials/{item_id}",
+            pt,
+            {},
+        )
         item = ItemCreate(
             code=m.get("code") or m.get("itemCode") or f"PROD-{item_id}",
             name=m.get("name") or m.get("description") or f"Material {item_id}",
@@ -356,7 +392,7 @@ def _ensure_material_integration(
         # Try fetch as equipment
         try:
             m = http_get(
-                API_BASE_PROD,
+                require_settings().API_BASE_PROD,
                 f"/pricebook/v2/tenant/{{tenant}}/equipment/{item_id}",
                 pt,
                 {},
@@ -395,7 +431,7 @@ def _ensure_material_integration(
 
     try:
         created = http_post_json(
-            API_BASE_INT, "/pricebook/v2/tenant/{tenant}/materials", it, payload
+            require_settings().API_BASE_INT, "/pricebook/v2/tenant/{tenant}/materials", it, payload
         )
         new_id = created.get("id")
         if new_id is not None:
@@ -407,7 +443,7 @@ def _ensure_material_integration(
         if isinstance(code, str) and "unique" in str(e).lower():
             alt = {**payload, "code": f"{code} - PROD-{item_id}"}
             created = http_post_json(
-                API_BASE_INT,
+                require_settings().API_BASE_INT,
                 "/pricebook/v2/tenant/{tenant}/materials",
                 it,
                 alt,
@@ -432,7 +468,8 @@ def _find_integration_vendor_by_name(name: str, it: str) -> int | None:
     name_l = (name or "").strip().lower()
     if not name_l:
         return None
-    for ven in fetch_all(cfg, API_BASE_INT, it, since=None):
+    s = require_settings()
+    for ven in fetch_all(cfg, s.API_BASE_INT, it, since=None):
         cand = (
             (ven.get("name") or ven.get("displayName") or ven.get("legalName") or "")
             .strip()
@@ -454,7 +491,8 @@ def _find_integration_material_by_code(code: str, it: str) -> int | None:
     code_l = (code or "").strip().lower()
     if not code_l:
         return None
-    for m in fetch_all(cfg, API_BASE_INT, it, since=None):
+    s = require_settings()
+    for m in fetch_all(cfg, s.API_BASE_INT, it, since=None):
         cand = (m.get("code") or m.get("itemCode") or "").strip().lower()
         if cand == code_l:
             return m.get("id")
@@ -470,15 +508,17 @@ def _find_integration_business_unit_by_name(name: str, it: str) -> int | None:
     name_l = (name or "").strip().lower()
     if not name_l:
         return None
+    s = require_settings()
     for path in paths:
         try:
-            data = http_get(API_BASE_INT, path, it, {"page": 1, "pageSize": 200})
+            data = http_get(s.API_BASE_INT, path, it, {"page": 1, "pageSize": 200})
         except Exception:
             continue
         items = data.get("data") or data.get("items") or []
         for bu in items:
             if (bu.get("name") or "").strip().lower() == name_l:
-                return bu.get("id")
+                bu_id_val = bu.get("id")
+                return int(bu_id_val) if isinstance(bu_id_val, int) else None
     return None
 
 
@@ -488,9 +528,10 @@ def _get_prod_business_unit_name(bu_id: int, pt: str) -> str | None:
         f"/crm/v2/tenant/{{tenant}}/business-units/{bu_id}",
         f"/settings/v2/tenant/{{tenant}}/business-units/{bu_id}",
     ]
+    s = require_settings()
     for path in paths:
         try:
-            d = http_get(API_BASE_PROD, path, pt, {})
+            d = http_get(s.API_BASE_PROD, path, pt, {})
             name = d.get("name") or (d.get("businessUnit") or {}).get("name")
             if name:
                 return str(name)
@@ -510,7 +551,7 @@ def _find_integration_warehouse_by_name(name: str, it: str) -> int | None:
     name_l = (name or "").strip().lower()
     if not name_l:
         return None
-    for wh in fetch_all(cfg, API_BASE_INT, it, since=None):
+    for wh in fetch_all(cfg, require_settings().API_BASE_INT, it, since=None):
         wh_name = (wh.get("name") or wh.get("displayName") or "").strip().lower()
         if wh_name == name_l:
             return wh.get("id")
@@ -519,8 +560,6 @@ def _find_integration_warehouse_by_name(name: str, it: str) -> int | None:
 
 def _normalize_address(addr: dict[str, Any]) -> dict[str, Any]:
     """Map various address shapes to the required keys: street, unit, city, state, zip, country."""
-    if not isinstance(addr, dict):
-        addr = {}
     street = addr.get("street") or addr.get("addressLine1") or addr.get("address1") or ""
     unit = addr.get("unit") or addr.get("addressLine2") or addr.get("address2") or ""
     city = addr.get("city") or ""
@@ -545,9 +584,11 @@ def _get_integration_warehouse_info(wh_id: int, it: str) -> dict[str, Any]:
         "list_data_key": "data",
         "next_page_key": "hasMore",
     }
-    for wh in fetch_all(cfg, API_BASE_INT, it, since=None):
+    s = require_settings()
+    for wh in fetch_all(cfg, s.API_BASE_INT, it, since=None):
         try:
-            if int(wh.get("id")) == int(wh_id):
+            wid_val = wh.get("id")
+            if isinstance(wid_val, int) and int(wid_val) == int(wh_id):
                 return wh
         except Exception:
             continue
@@ -569,8 +610,9 @@ def _ensure_warehouse_integration(
             return None
 
     # Fetch from Prod
+    s = require_settings()
     w = http_get(
-        API_BASE_PROD, f"/inventory/v2/tenant/{{tenant}}/warehouses/{warehouse_id}", pt, {}
+        s.API_BASE_PROD, f"/inventory/v2/tenant/{{tenant}}/warehouses/{warehouse_id}", pt, {}
     )
 
     w_name = w.get("name") or w.get("displayName") or f"Warehouse {warehouse_id}"
@@ -598,7 +640,7 @@ def _ensure_warehouse_integration(
         logger.info("DRY RUN - Would create warehouse", payload=payload)
         return None
 
-    created = http_post_json(API_BASE_INT, "/inventory/v2/tenant/{tenant}/warehouses", it, payload)
+    created = http_post_json(require_settings().API_BASE_INT, "/inventory/v2/tenant/{tenant}/warehouses", it, payload)
     new_id = created.get("id") or created.get("warehouseId")
     if new_id is not None:
         db.put("warehouses", wid, str(new_id))
@@ -616,7 +658,7 @@ def _ensure_warehouse_integration(
 )
 @click.option("--dry-run", is_flag=True, help="print payloads; don't POST")
 @click.option("--verbose", is_flag=True, help="verbose logging")
-def copy_po(po_id, default_warehouse_id, dry_run, verbose):
+def copy_po(po_id: str, default_warehouse_id: int | None, dry_run: bool, verbose: bool) -> None:
     """Copy a single PO by ID from Prod to Integration, ensuring dependencies (vendor, materials)."""
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -636,9 +678,9 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
         print_error(f"Auth error: {e}")
         return
 
-    # Fetch PO from Prod
+    # Fetch PO from Prod (supports numeric id or PO number/external number)
     try:
-        src = _get_prod_po_by_id(po_id, pt)
+        src = _get_prod_po_by_identifier(po_id, pt)
     except Exception as e:
         print_error(f"Failed to fetch Production PO {po_id}: {e}")
         return
@@ -834,7 +876,7 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
     try:
         # POST plain body (no wrapper) for purchase-orders
         created = http_post_json(
-            API_BASE_INT,
+            require_settings().API_BASE_INT,
             "/inventory/v2/tenant/{tenant}/purchase-orders",
             it,
             po_body,
@@ -857,7 +899,7 @@ def copy_po(po_id, default_warehouse_id, dry_run, verbose):
 @click.option("--limit", type=int, default=0, help="max records; 0 = unlimited")
 @click.option("--dry-run", is_flag=True, help="print payloads; don't POST")
 @click.option("--verbose", is_flag=True, help="verbose logging")
-def sync(kind, since, limit, dry_run, verbose):
+def sync(kind: str, since: str | None, limit: int, dry_run: bool, verbose: bool) -> None:
     """Copy records from Prod → Integration for a given entity kind."""
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -882,7 +924,7 @@ def sync(kind, since, limit, dry_run, verbose):
         # Select mapper or specialized flow
         if kind == "items":
 
-            def item_mapper(src):
+            def item_mapper(src: dict[str, Any]) -> dict[str, Any]:
                 return map_item_for_create(src)
 
             mapper = item_mapper
@@ -890,7 +932,7 @@ def sync(kind, since, limit, dry_run, verbose):
             mapper = None  # handled by v2 flow below
         elif kind == "jobs":
 
-            def job_mapper(src):
+            def job_mapper(src: dict[str, Any]) -> dict[str, Any]:
                 return map_job_for_create(src, db.get)
 
             mapper = job_mapper
@@ -908,7 +950,7 @@ def sync(kind, since, limit, dry_run, verbose):
         # Pre-fetch optional constants
         po_type_id_cache: int | None = None
 
-        for src in fetch_all(ent, API_BASE_PROD, pt, since):
+        for src in fetch_all(ent, require_settings().API_BASE_PROD, pt, since):
             prod_id = str(src.get("id") or src.get("guid") or src.get("externalId") or "")
             if not prod_id:
                 logger.warning("Skipping record with no ID", source_data=src)
@@ -920,15 +962,15 @@ def sync(kind, since, limit, dry_run, verbose):
                 continue
 
             try:
-                if kind != "pos":
+                if mapper is not None:
                     # Legacy flow for items/jobs
-                    payload = mapper(src)  # type: ignore
+                    payload = mapper(src)
                     if dry_run:
                         print_msg(f"DRY RUN - Would create {kind}:")
                         print(json.dumps(payload, indent=2))
                     else:
                         created_data = http_post_json(
-                            API_BASE_INT, ent["int_create_path"], it, payload
+                            require_settings().API_BASE_INT, ent["int_create_path"], it, payload
                         )
                         int_id = str(
                             created_data.get("id")
@@ -1105,7 +1147,7 @@ def sync(kind, since, limit, dry_run, verbose):
                         print(json.dumps(po_body, indent=2))
                     else:
                         created_data = http_post_json(
-                            API_BASE_INT,
+                            require_settings().API_BASE_INT,
                             "/inventory/v2/tenant/{tenant}/purchase-orders",
                             it,
                             po_body,

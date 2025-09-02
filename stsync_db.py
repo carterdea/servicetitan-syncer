@@ -7,6 +7,11 @@ from stsync_settings import get_settings
 
 
 class IDMapper:
+    """Lightweight SQLite-backed crosswalk for (kind, prod_id) -> int_id.
+
+    Thread-safety: uses short-lived connections per operation; sufficient for CLI use.
+    """
+
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or get_settings().DB_PATH
         self._init_db()
@@ -24,6 +29,7 @@ class IDMapper:
             )
 
     def get(self, kind: str, prod_id: str) -> str | None:
+        """Return integration id string for a given kind/prod_id, or None."""
         with sqlite3.connect(self.db_path) as cx:
             cur = cx.execute(
                 "SELECT int_id FROM id_map WHERE kind=? AND prod_id=?", (kind, prod_id)
@@ -32,6 +38,7 @@ class IDMapper:
             return r[0] if r else None
 
     def put(self, kind: str, prod_id: str, int_id: str) -> None:
+        """Insert or update the mapping for (kind, prod_id) to int_id."""
         with sqlite3.connect(self.db_path) as cx:
             cx.execute(
                 "INSERT OR REPLACE INTO id_map(kind, prod_id, int_id, created_at) VALUES(?,?,?,?)",
@@ -40,5 +47,5 @@ class IDMapper:
             cx.commit()
 
     def exists(self, kind: str, prod_id: str) -> bool:
+        """True if a mapping exists for (kind, prod_id)."""
         return self.get(kind, prod_id) is not None
-
