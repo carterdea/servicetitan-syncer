@@ -49,6 +49,8 @@ class RawSettings(BaseModel):
     ST_SHIPTO_STATE: str | None = None
     ST_SHIPTO_ZIP: str | None = None
     ST_SHIPTO_COUNTRY: str | None = "US"
+    # Configurable PO type keywords (comma-separated)
+    ST_PO_TYPE_KEYWORDS: str = "stock,inventory"
 
 
 class SettingsStrict(BaseModel):
@@ -77,6 +79,7 @@ class SettingsStrict(BaseModel):
     ST_SHIPTO_STATE: str | None = None
     ST_SHIPTO_ZIP: str | None = None
     ST_SHIPTO_COUNTRY: str | None = "US"
+    ST_PO_TYPE_KEYWORDS: str = "stock,inventory"
 
 
 _cache: RawSettings | None = None
@@ -119,6 +122,8 @@ def _read_env_dict() -> dict:
         "DB_PATH": os.getenv("STSYNC_DB", "stsync.sqlite3"),
         "PAGE_SIZE_DEFAULT": int(os.getenv("ST_PAGE_SIZE", "200")),
         "HTTP_TIMEOUT": int(os.getenv("ST_HTTP_TIMEOUT", "30")),
+        # Preferences
+        "ST_PO_TYPE_KEYWORDS": os.getenv("ST_PO_TYPE_KEYWORDS", "stock,inventory"),
         # Optional fallbacks
         "ST_DEFAULT_WAREHOUSE_ID_INT": _safe_int_env("ST_DEFAULT_WAREHOUSE_ID_INT"),
         "ST_DEFAULT_BUSINESS_UNIT_ID_INT": _safe_int_env(
@@ -135,6 +140,7 @@ def _read_env_dict() -> dict:
 
 
 def get_settings() -> RawSettings:
+    """Return partially validated settings (optional fields allowed, cached)."""
     global _cache
     if _cache is None:
         _cache = RawSettings(**_read_env_dict())
@@ -142,13 +148,13 @@ def get_settings() -> RawSettings:
 
 
 def require_settings() -> SettingsStrict:
-    """Return validated settings; raises ValidationError if any required are missing."""
+    """Return fully validated settings; raises ValidationError if required are missing."""
     data = _read_env_dict()
     return SettingsStrict(**data)
 
 
 def missing_required_keys() -> list[str]:
-    """Return list of missing required env keys for user-friendly errors."""
+    """Return a list of missing required env keys for user-friendly errors."""
     required = [
         "ST_AUTH_URL_PROD",
         "ST_AUTH_URL_INT",

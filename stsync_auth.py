@@ -10,6 +10,7 @@ from tenacity import (
 )
 
 from stsync_settings import require_settings
+from typing import Any, cast
 
 logger = structlog.get_logger()
 
@@ -20,6 +21,10 @@ logger = structlog.get_logger()
     retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError)),
 )
 def token(auth_url: str, client_id: str, client_secret: str, scope: str = "") -> str:
+    """Fetch an OAuth2 client-credentials token.
+
+    Raises RuntimeError with a descriptive message on failure.
+    """
     settings = require_settings()
     env_name = "Integration" if "integration" in (auth_url or "").lower() else "Production"
 
@@ -31,7 +36,11 @@ def token(auth_url: str, client_id: str, client_secret: str, scope: str = "") ->
     try:
         r = httpx.post(auth_url, data=data, auth=(client_id, client_secret), timeout=settings.HTTP_TIMEOUT)
         r.raise_for_status()
-        return r.json()["access_token"]
+        data = cast(dict[str, Any], r.json())
+        token_val = data.get("access_token")
+        if isinstance(token_val, str):
+            return token_val
+        raise RuntimeError("Authentication succeeded but no access_token in response")
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
             logger.warning(
@@ -54,10 +63,12 @@ def token(auth_url: str, client_id: str, client_secret: str, scope: str = "") ->
 
 
 def prod_token() -> str:
+    """Short-hand: token() for Production environment settings."""
     s = require_settings()
     return token(s.AUTH_URL_PROD, s.CLIENT_ID_PROD, s.CLIENT_SECRET_PROD)
 
 
 def int_token() -> str:
+    """Short-hand: token() for Integration environment settings."""
     s = require_settings()
     return token(s.AUTH_URL_INT, s.CLIENT_ID_INT, s.CLIENT_SECRET_INT)
