@@ -50,9 +50,16 @@ def _handle_rate_limit_and_server_error(r: httpx.Response, url: str, env_name: s
 
 
 @retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential_jitter(1, 5),
-    retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError)),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential_jitter(1, 6),
+    retry=retry_if_exception_type(
+        (
+            httpx.HTTPStatusError,
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.TimeoutException,
+        )
+    ),
 )
 def http_get(base: str, path: str, bearer: str, params: dict[str, Any]) -> dict[str, Any]:
     """HTTP GET with auth, app key, retries, and structured logging.
@@ -99,9 +106,16 @@ def http_get(base: str, path: str, bearer: str, params: dict[str, Any]) -> dict[
 
 
 @retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential_jitter(1, 5),
-    retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError)),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential_jitter(1, 6),
+    retry=retry_if_exception_type(
+        (
+            httpx.HTTPStatusError,
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.TimeoutException,
+        )
+    ),
 )
 def http_post_json(
     base: str,
@@ -139,8 +153,10 @@ def http_post_json(
         }
         r = httpx.post(url, headers=headers, json=payload, timeout=s.HTTP_TIMEOUT)
 
-        if _handle_rate_limit_and_server_error(r, url, env_name):
-            if allow_wrapper_retry and "request" in (r.text or "").lower():
+        # Check for wrapper requirement on both 400 and 5xx errors
+        if r.status_code >= 400:
+            response_text = r.text or ""
+            if allow_wrapper_retry and "request" in response_text.lower() and '"request"' in response_text.lower():
                 try:
                     wrapped = {"request": payload}
                     logger.info("Retrying POST with request wrapper", url=url)
@@ -156,7 +172,10 @@ def http_post_json(
                         url=url,
                         error=str(wrap_err),
                     )
-            raise RuntimeError(f"POST {url} -> {r.status_code}: {r.text[:200]}")
+
+            # Handle rate limiting and server errors
+            if _handle_rate_limit_and_server_error(r, url, env_name):
+                raise RuntimeError(f"POST {url} -> {r.status_code}: {r.text[:200]}")
 
         r.raise_for_status()
         try:
