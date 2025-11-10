@@ -122,6 +122,9 @@ ST_SHIPTO_STATE=
 ST_SHIPTO_ZIP=
 ST_SHIPTO_COUNTRY=US
 
+# Optional PO type selection (comma-separated keywords)
+ST_PO_TYPE_KEYWORDS=stock,inventory  # First matching type name is used; falls back to first type
+
 # Database
 STSYNC_DB=stsync.sqlite3
 
