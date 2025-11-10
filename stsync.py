@@ -23,6 +23,7 @@ import logging
 import os
 import time
 from typing import Any, Callable
+from datetime import datetime, timezone
 
 import click
 import structlog
@@ -102,6 +103,21 @@ def map_item_for_create(src: dict[str, Any]) -> dict[str, Any]:
     except ValidationError as e:
         logger.error("Invalid item data", source_data=src, validation_errors=e.errors())
         raise
+
+
+def _iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _parse_iso_dt(s: str | None) -> datetime | None:
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        # Support trailing 'Z' and explicit offsets
+        s2 = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(s2)
+    except Exception:
+        return None
 
 
 def map_po_for_create(
@@ -267,17 +283,20 @@ def verify() -> None:
 
 
 def _get_prod_po_by_identifier(identifier: str, bearer: str) -> dict[str, Any]:
-    """Fetch a Production PO by numeric ID or by PO number/external number.
+    """Fetch a Production PO by ID or number.
 
-    - If `identifier` is digits-only, try direct GET by ID.
-    - Otherwise, or on failure, scan the list endpoint and match by `number` or `externalNumber`.
+    Normalizes the input by stripping all non‑digits first (e.g., "IM-113552048" → "113552048")
+    and tries direct GET by numeric id. If not found, scans the list endpoint and matches by
+    `number` or `externalNumber` (also compared in digits‑only form).
     """
     s = require_settings()
 
-    # Try direct by ID when numeric
-    if identifier.isdigit():
+    # Normalize to digits only and try direct by ID
+    ident_raw = identifier.strip()
+    ident_digits = "".join(ch for ch in ident_raw if ch.isdigit())
+    if ident_digits:
         try:
-            path = f"/inventory/v2/tenant/{{tenant}}/purchase-orders/{identifier}"
+            path = f"/inventory/v2/tenant/{{tenant}}/purchase-orders/{ident_digits}"
             return http_get(s.API_BASE_PROD, path, bearer, params={})
         except Exception:
             pass
@@ -289,14 +308,48 @@ def _get_prod_po_by_identifier(identifier: str, bearer: str) -> dict[str, Any]:
         "list_data_key": "data",
         "next_page_key": "hasMore",
     }
-    ident = identifier.strip()
+    ident = ident_raw
     for po in fetch_all(cfg, s.API_BASE_PROD, bearer, since=None):
         num = po.get("number") or po.get("purchaseOrderNumber") or po.get("poNumber")
         ext = po.get("externalNumber") or po.get("externalId")
-        if str(num) == ident or str(ext) == ident:
+        num_d = "".join(ch for ch in str(num) if ch.isdigit()) if num is not None else ""
+        ext_d = "".join(ch for ch in str(ext) if ch.isdigit()) if ext is not None else ""
+        if str(num) == ident or str(ext) == ident or num_d == ident_digits or ext_d == ident_digits:
             return po
 
     raise RuntimeError(f"Purchase Order not found by id or number: {identifier}")
+
+
+def _get_prod_po_by_number(number: str, bearer: str) -> dict[str, Any]:
+    """Fetch a Production PO strictly by PO Number or external number.
+
+    Unlike `_get_prod_po_by_identifier`, this does not attempt a direct GET by
+    numeric ID. It scans the list endpoint and matches against `number` and
+    `externalNumber` (and their digits-only variants) for an exact match.
+    """
+    s = require_settings()
+    cfg = {
+        "prod_list_path": "/inventory/v2/tenant/{tenant}/purchase-orders",
+        "list_params": {"page": 1, "pageSize": 200},
+        "list_data_key": "data",
+        "next_page_key": "hasMore",
+    }
+    ident_raw = number.strip()
+    ident_digits = "".join(ch for ch in ident_raw if ch.isdigit())
+    for po in fetch_all(cfg, s.API_BASE_PROD, bearer, since=None):
+        num = po.get("number") or po.get("purchaseOrderNumber") or po.get("poNumber")
+        ext = po.get("externalNumber") or po.get("externalId")
+        num_d = "".join(ch for ch in str(num) if ch.isdigit()) if num is not None else ""
+        ext_d = "".join(ch for ch in str(ext) if ch.isdigit()) if ext is not None else ""
+        if (
+            (num is not None and str(num) == ident_raw)
+            or (ext is not None and str(ext) == ident_raw)
+            or (num_d and num_d == ident_digits)
+            or (ext_d and ext_d == ident_digits)
+        ):
+            return po
+
+    raise RuntimeError(f"Purchase Order not found by number: {number}")
 
 
 def _ensure_vendor_integration(
@@ -484,7 +537,8 @@ def _find_integration_material_by_code(code: str, it: str) -> int | None:
     """Scan Integration materials and return id by exact code (case-insensitive)."""
     cfg = {
         "prod_list_path": "/pricebook/v2/tenant/{tenant}/materials",
-        "list_params": {"page": 1, "pageSize": 200},
+        # Use PAGE_SIZE_DEFAULT from settings via fetch_all (pageSize=0 → default)
+        "list_params": {"page": 1, "pageSize": 0},
         "list_data_key": "data",
         "next_page_key": "hasMore",
     }
@@ -649,7 +703,13 @@ def _ensure_warehouse_integration(
 
 
 @cli.command("copy-po")
-@click.option("--id", "po_id", required=True, help="Production PO ID to copy")
+@click.option("--id", "po_id", required=False, help="Production PO ID to copy")
+@click.option(
+    "--number",
+    "po_number",
+    required=False,
+    help="Production PO Number to copy (treats value strictly as number, not ID)",
+)
 @click.option(
     "--default-warehouse-id",
     type=int,
@@ -658,7 +718,13 @@ def _ensure_warehouse_integration(
 )
 @click.option("--dry-run", is_flag=True, help="print payloads; don't POST")
 @click.option("--verbose", is_flag=True, help="verbose logging")
-def copy_po(po_id: str, default_warehouse_id: int | None, dry_run: bool, verbose: bool) -> None:
+def copy_po(
+    po_id: str | None,
+    po_number: str | None,
+    default_warehouse_id: int | None,
+    dry_run: bool,
+    verbose: bool,
+) -> None:
     """Copy a single PO by ID from Prod to Integration, ensuring dependencies (vendor, materials)."""
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -678,11 +744,24 @@ def copy_po(po_id: str, default_warehouse_id: int | None, dry_run: bool, verbose
         print_error(f"Auth error: {e}")
         return
 
-    # Fetch PO from Prod (supports numeric id or PO number/external number)
+    # Validate selector
+    if not po_id and not po_number:
+        print_error("Provide either --id or --number")
+        return
+    if po_id and po_number:
+        print_error("Use only one of --id or --number, not both")
+        return
+
+    # Fetch PO from Prod: by number (strict) or by id/identifier (legacy)
     try:
-        src = _get_prod_po_by_identifier(po_id, pt)
+        if po_number:
+            src = _get_prod_po_by_number(po_number, pt)
+        else:
+            assert po_id is not None
+            src = _get_prod_po_by_identifier(po_id, pt)
     except Exception as e:
-        print_error(f"Failed to fetch Production PO {po_id}: {e}")
+        ident = po_number or po_id or ""
+        print_error(f"Failed to fetch Production PO {ident}: {e}")
         return
 
     # Resolve vendor
@@ -748,12 +827,8 @@ def copy_po(po_id: str, default_warehouse_id: int | None, dry_run: bool, verbose
                 "quantityOrdered": qty,
                 "unitCost": unit_cost,
                 "cost": unit_cost,
+                "vendorPartNumber": ln.get("vendorPartNumber") or "",
                 **({"description": name_hint} if name_hint else {}),
-                **(
-                    {"vendorPartNumber": ln.get("vendorPartNumber")}
-                    if ln.get("vendorPartNumber")
-                    else {}
-                ),
             }
         )
         lines_payload_dry.append(
@@ -832,16 +907,32 @@ def copy_po(po_id: str, default_warehouse_id: int | None, dry_run: bool, verbose
         if v:
             addr_norm[k] = v
 
+    # Choose base dates
+    po_date_str = (
+        src.get("createdOn")
+        or src.get("orderedOn")
+        or src.get("modifiedOn")
+        or _iso_now()
+    )
+    required_on_str = (
+        src.get("requiredOn")
+        or src.get("expectedOn")
+        or src.get("createdOn")
+        or _iso_now()
+    )
+    # Enforce requiredOn >= date to satisfy API validation
+    d_po = _parse_iso_dt(po_date_str)
+    d_req = _parse_iso_dt(required_on_str)
+    if d_po and d_req and d_req < d_po:
+        required_on_str = po_date_str
+
     po_body = {
         "vendorId": int(vendor_int_id)
         if vendor_int_id is not None
         else int(vendor_id)
         if vendor_id
         else 0,
-        "date": src.get("createdOn")
-        or src.get("orderedOn")
-        or src.get("modifiedOn")
-        or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "date": po_date_str,
         "typeId": int(type_id),
         "externalNumber": f"PROD-{src.get('id') or po_id}",
         # Some tenants require both a top-level inventoryLocationId and shipTo object
@@ -855,10 +946,7 @@ def copy_po(po_id: str, default_warehouse_id: int | None, dry_run: bool, verbose
         },
         "tax": 0,
         "shipping": 0,
-        "requiredOn": src.get("requiredOn")
-        or src.get("expectedOn")
-        or src.get("createdOn")
-        or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "requiredOn": required_on_str,
         "businessUnitId": int(bu_id) if bu_id else None,
         "impactsTechnicianPayroll": False,
         "items": [{k: v for k, v in itm.items() if v is not None} for itm in lines_payload],
@@ -874,18 +962,43 @@ def copy_po(po_id: str, default_warehouse_id: int | None, dry_run: bool, verbose
 
     # Create PO in Integration
     try:
-        # POST plain body (no wrapper) for purchase-orders
+        # POST payload directly (no wrapper for purchase-orders)
         created = http_post_json(
             require_settings().API_BASE_INT,
             "/inventory/v2/tenant/{tenant}/purchase-orders",
             it,
             po_body,
-            allow_wrapper_retry=False,
+            allow_wrapper_retry=True,
         )
         int_po_id = created.get("id") or created.get("purchaseOrderId")
         if int_po_id:
-            db.put("pos", str(src.get("id") or po_id), str(int_po_id))
-            print_success(f"Created Integration PO {int_po_id} for Prod {po_id}")
+            # Persist crosswalk
+            db.put("pos", str(src.get("id") or po_id or po_number or ""), str(int_po_id))
+
+            # Try to fetch the PO Number from Integration (often equals id)
+            try:
+                po_int = http_get(
+                    require_settings().API_BASE_INT,
+                    f"/inventory/v2/tenant/{{tenant}}/purchase-orders/{int_po_id}",
+                    it,
+                    {},
+                )
+                po_number = (
+                    po_int.get("number")
+                    or po_int.get("purchaseOrderNumber")
+                    or po_int.get("poNumber")
+                    or int_po_id
+                )
+            except Exception:
+                po_number = int_po_id
+
+            # Emit concise result and a final line with just the number label
+            src_ident = po_number if po_number and (po_id is None and po_number) else (po_id or po_number)
+            print_success(
+                f"Created Integration PO {int_po_id} for Prod {src.get('id') or po_id or po_number}"
+            )
+            print_success(f"Integration PO Number: {po_number}")
+            print_msg(f"NEW PO NUMBER: {po_number}")
         else:
             print_msg("Warning: Create PO succeeded but no id returned")
     except Exception as e:
@@ -1061,12 +1174,8 @@ def sync(kind: str, since: str | None, limit: int, dry_run: bool, verbose: bool)
                                 "quantityOrdered": qty,
                                 "unitCost": unit_cost,
                                 "cost": unit_cost,
+                                "vendorPartNumber": ln.get("vendorPartNumber") or "",
                                 **({"description": name_hint} if name_hint else {}),
-                                **(
-                                    {"vendorPartNumber": ln.get("vendorPartNumber")}
-                                    if ln.get("vendorPartNumber")
-                                    else {}
-                                ),
                             }
                         )
 
@@ -1108,16 +1217,31 @@ def sync(kind: str, since: str | None, limit: int, dry_run: bool, verbose: bool)
                         if v:
                             addr_norm[k] = v
 
+                    # Choose base dates
+                    po_date_str = (
+                        src.get("createdOn")
+                        or src.get("orderedOn")
+                        or src.get("modifiedOn")
+                        or _iso_now()
+                    )
+                    required_on_str = (
+                        src.get("requiredOn")
+                        or src.get("expectedOn")
+                        or src.get("createdOn")
+                        or _iso_now()
+                    )
+                    d_po = _parse_iso_dt(po_date_str)
+                    d_req = _parse_iso_dt(required_on_str)
+                    if d_po and d_req and d_req < d_po:
+                        required_on_str = po_date_str
+
                     po_body = {
                         "vendorId": int(vendor_int_id)
                         if vendor_int_id is not None
                         else int(vendor_id)
                         if vendor_id
                         else 0,
-                        "date": src.get("createdOn")
-                        or src.get("orderedOn")
-                        or src.get("modifiedOn")
-                        or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "date": po_date_str,
                         "typeId": int(po_type_id_cache),
                         "externalNumber": f"PROD-{src.get('id') or prod_id}",
                         "inventoryLocationId": int(wh_int_id),
@@ -1130,10 +1254,7 @@ def sync(kind: str, since: str | None, limit: int, dry_run: bool, verbose: bool)
                         },
                         "tax": 0,
                         "shipping": 0,
-                        "requiredOn": src.get("requiredOn")
-                        or src.get("expectedOn")
-                        or src.get("createdOn")
-                        or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "requiredOn": required_on_str,
                         "businessUnitId": int(bu_int_id) if bu_int_id else None,
                         "impactsTechnicianPayroll": False,
                         "items": [
@@ -1146,12 +1267,13 @@ def sync(kind: str, since: str | None, limit: int, dry_run: bool, verbose: bool)
                         print_msg("DRY RUN - Would create pos:")
                         print(json.dumps(po_body, indent=2))
                     else:
+                        # POST payload directly (no manual wrapper)
                         created_data = http_post_json(
                             require_settings().API_BASE_INT,
                             "/inventory/v2/tenant/{tenant}/purchase-orders",
                             it,
                             po_body,
-                            allow_wrapper_retry=False,
+                            allow_wrapper_retry=True,
                         )
                         int_id = str(created_data.get("id") or "")
                         if int_id:

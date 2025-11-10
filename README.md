@@ -69,11 +69,14 @@ uv run stsync sync pos   --since 2025-08-01 --limit 50
 uv run stsync sync jobs  --since 2025-08-01 --limit 50
 ```
 
-## One-off copy by Production PO ID
+## One-off copy by Production PO
 
 ```bash
-# Dry run (prints payloads)
+# By ID (Dry run prints payloads)
 uv run stsync copy-po --id <PROD_PO_ID> --dry-run --verbose
+
+# By PO Number (treats input strictly as a PO number)
+uv run stsync copy-po --number <PROD_PO_NUMBER> --verbose
 
 # Real run (ensures vendor/materials/warehouse, creates PO in Integration)
 uv run stsync copy-po --id <PROD_PO_ID> --verbose
@@ -211,6 +214,11 @@ The order of syncing is important due to foreign key relationships:
 4. **"Invalid job data"**
    - Verify customers, locations, job types exist in Integration
    - May need to sync master data first
+
+5. **Read timeouts during material scans**
+   - Increase timeout: set `ST_HTTP_TIMEOUT=60` (or `90`) in `.env`.
+   - Reduce page size default: set `ST_PAGE_SIZE=100`.
+   - Retries now cover timeouts; re-run if the error was transient.
 
 ### Debug Mode
 
